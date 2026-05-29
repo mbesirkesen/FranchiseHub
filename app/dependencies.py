@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 
 from fastapi import Depends, HTTPException, status
@@ -6,7 +8,7 @@ from jose import JWTError
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import Admin, Buyer, FranchiseOwner, UserRole
+from .models import Buyer, FranchiseOwner, UserRole
 from .schemas import AuthenticatedPrincipal
 from .security import decode_access_token
 
@@ -20,7 +22,7 @@ def _resolve_principal(db: Session, role: UserRole, subject_id: int) -> Authenti
     elif role == UserRole.franchise_owner:
         user = db.get(FranchiseOwner, subject_id)
     else:
-        user = db.get(Admin, subject_id)
+        return None
 
     if user is None:
         return None
@@ -51,6 +53,19 @@ def get_current_principal(
     principal = _resolve_principal(db, role, subject_id)
     if principal is None:
         raise credentials_exception
+
+    if role == UserRole.buyer:
+        account = db.get(Buyer, subject_id)
+    elif role == UserRole.franchise_owner:
+        account = db.get(FranchiseOwner, subject_id)
+    else:
+        raise credentials_exception
+    if account is None or not account.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is inactive",
+        )
+
     return principal
 
 
