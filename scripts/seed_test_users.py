@@ -1,5 +1,5 @@
 """
-Demo seed: tek buyer, tek franchise_owner, tek admin.
+Demo seed: tek buyer, tek franchise_owner.
 API testleri icin marka, basvurular, mesajlar, envanter, tedarik talepleri doldurulur.
 Ayni script birden fazla calistirilabilir (idempotent).
 """
@@ -14,16 +14,20 @@ if str(ROOT_DIR) not in sys.path:
 
 from app.database import Base, SessionLocal, engine
 from app.models import (
-    Admin,
     Application,
     ApplicationStatus,
     Brand,
+    BrandTerritory,
     Buyer,
+    FranchiseOutlet,
     FranchiseOwner,
     Inventory,
     Message,
+    Notification,
+    OutletStatus,
     SupplyRequest,
     SupplyRequestStatus,
+    TerritoryStatus,
     UserRole,
 )
 from app.security import hash_password
@@ -34,9 +38,6 @@ BUYER_PASSWORD = "Buyer12345!"
 
 OWNER_EMAIL = "owner1@franchisehub.local"
 OWNER_PASSWORD = "Owner12345!"
-
-ADMIN_EMAIL = "admin1@franchisehub.local"
-ADMIN_PASSWORD = "Admin12345!"
 
 # Basvuru notlari (tekrar calistirmada ayirt etmek icin)
 NOTE_PENDING = "[SEED] Demo basvuru — beklemede"
@@ -54,6 +55,17 @@ SUPPLY_SEED_ROWS = [
     ("SEED | Kahve cekirdegi (kg)", 25, SupplyRequestStatus.pending),
     ("SEED | Ambalaj malzemesi", 300, SupplyRequestStatus.pending),
     ("SEED | Temizlik urunu seti", 15, SupplyRequestStatus.approved),
+]
+
+OUTLET_SEED_ROWS = [
+    ("SEED | Kadikoy Subesi", "Istanbul", "Kadikoy, Istanbul", OutletStatus.active),
+    ("SEED | Cankaya Subesi", "Ankara", "Cankaya, Ankara", OutletStatus.planned),
+]
+
+TERRITORY_SEED_ROWS = [
+    ("SEED | Istanbul Avrupa", "TR-34-AVR", TerritoryStatus.available),
+    ("SEED | Ankara Merkez", "TR-06-MRK", TerritoryStatus.available),
+    ("SEED | Izmir Konak", "TR-35-KNK", TerritoryStatus.reserved),
 ]
 
 
@@ -112,20 +124,7 @@ def seed() -> None:
             db.add(owner)
         db.flush()
 
-        # --- 3) Admin ---
-        admin = db.scalar(select(Admin).where(Admin.email == ADMIN_EMAIL))
-        if admin is None:
-            admin = Admin(
-                email=ADMIN_EMAIL,
-                hashed_password=hash_password(ADMIN_PASSWORD),
-                full_name="Platform Admin (Seed)",
-                phone="+905550003333",
-                authorization_level="supervisor",
-                is_superadmin=True,
-            )
-            db.add(admin)
-
-        # --- 4) Marka (owner’a bagli, buyer listesinde gorunsun) ---
+        # --- 3) Marka (owner’a bagli, buyer listesinde gorunsun) ---
         brand = db.scalar(select(Brand).where(Brand.franchise_owner_id == owner.id))
         if brand is None:
             brand = Brand(
@@ -244,6 +243,92 @@ def seed() -> None:
                 sr.quantity = quantity
                 sr.status = st
 
+        # --- 9) Subeler ---
+        for name, city, address, st in OUTLET_SEED_ROWS:
+            outlet = db.scalar(
+                select(FranchiseOutlet).where(
+                    FranchiseOutlet.franchise_owner_id == owner.id,
+                    FranchiseOutlet.name == name,
+                )
+            )
+            if outlet is None:
+                db.add(
+                    FranchiseOutlet(
+                        franchise_owner_id=owner.id,
+                        brand_id=brand.id,
+                        name=name,
+                        city=city,
+                        address=address,
+                        status=st,
+                    )
+                )
+            else:
+                outlet.city = city
+                outlet.address = address
+                outlet.status = st
+                outlet.brand_id = brand.id
+
+        # --- 10) Bolgeler (discovery /territories) ---
+        for name, region_code, st in TERRITORY_SEED_ROWS:
+            terr = db.scalar(
+                select(BrandTerritory).where(
+                    BrandTerritory.brand_id == brand.id,
+                    BrandTerritory.name == name,
+                )
+            )
+            if terr is None:
+                db.add(
+                    BrandTerritory(
+                        brand_id=brand.id,
+                        name=name,
+                        region_code=region_code,
+                        status=st,
+                    )
+                )
+            else:
+                terr.region_code = region_code
+                terr.status = st
+
+        # --- 11) Ornek bildirimler ---
+        seed_notes = [
+            (
+                UserRole.buyer,
+                buyer.id,
+                "[SEED] Basvuru guncellendi",
+                "Onayli basvurunuz icin mesajlasma acildi.",
+                "application",
+                app_approved.id,
+            ),
+            (
+                UserRole.franchise_owner,
+                owner.id,
+                "[SEED] Yeni basvuru",
+                "Markaniza yeni bir basvuru geldi.",
+                "application",
+                app_pending.id,
+            ),
+        ]
+        for role, uid, title, body, ntype, rid in seed_notes:
+            exists = db.scalar(
+                select(Notification.id).where(
+                    Notification.recipient_role == role,
+                    Notification.recipient_id == uid,
+                    Notification.title == title,
+                )
+            )
+            if exists is None:
+                db.add(
+                    Notification(
+                        recipient_role=role,
+                        recipient_id=uid,
+                        title=title,
+                        body=body,
+                        notification_type=ntype,
+                        resource_type="application" if rid else None,
+                        resource_id=rid,
+                    )
+                )
+
         db.commit()
 
         # Ozet
@@ -264,10 +349,9 @@ def seed() -> None:
             )
         )
 
-        print("=== Seed tamamlandi (3 kullanici + tam demo veri) ===")
+        print("=== Seed tamamlandi (2 kullanici + tam demo veri) ===")
         print(f"Buyer:     {BUYER_EMAIL} / {BUYER_PASSWORD}")
         print(f"Owner:     {OWNER_EMAIL} / {OWNER_PASSWORD}")
-        print(f"Admin:     {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
         print(f"Marka:     id={brand.id} {brand.name!r} (onayli={brand.is_approved})")
         print(f"Basvurular: pending id={app_pending.id}, approved id={app_approved.id}, rejected id={app_rejected.id} (toplam markaya: {n_apps})")
         print(f"Mesajlar (onayli basvuru): {n_msg}")

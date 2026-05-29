@@ -1,15 +1,24 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from __future__ import annotations
+
+from typing import Optional
+
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from ..brand_service import media_to_read
 from ..database import get_db
 from ..dependencies import get_current_principal, require_roles
 from ..models import (
     Application,
     ApplicationStatus,
     Brand,
+    BrandFDDDocument,
+    BrandMedia,
+    BrandMediaType,
     Inventory,
-    Message,
     SupplyRequest,
     SupplyRequestStatus,
     UserRole,
@@ -19,12 +28,15 @@ from ..schemas import (
     ApplicationRead,
     ApplicationUpdate,
     AuthenticatedPrincipal,
+    BrandFDDRead,
+    BrandFDDUploadResponse,
+    BrandMediaUploadResponse,
     BrandRead,
     FranchiseOwnerBrandWrite,
     FranchiseOwnerDashboardSummary,
-    MessageCreate,
-    MessageRead,
 )
+from ..pagination import paginated_meta
+from ..storage import ALLOWED_IMAGE_TYPES, ALLOWED_PDF_TYPES, save_upload_file
 
 router = APIRouter(tags=["franchise-owner"])
 
@@ -150,7 +162,7 @@ def franchise_owner_dashboard_summary(
 
 @router.get(
     "/franchise-owner/my-brand",
-    response_model=BrandRead | None,
+    response_model=Optional[BrandRead],
     dependencies=[Depends(require_roles(UserRole.franchise_owner))],
 )
 def get_my_brand(
@@ -248,24 +260,105 @@ def update_my_brand(
     return brand
 
 
+@router.post(
+    "/franchise-owner/brand/media",
+    response_model=BrandMediaUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+async def upload_brand_media(
+    file: UploadFile = File(...),
+    media_type: BrandMediaType = Form(...),
+    sort_order: int = Form(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    brand = get_owned_brand_or_404(db, current_user)
+    relative_path, mime_type, _size = save_upload_file(
+        file,
+        subdir=f"brands/{brand.id}/media",
+        allowed_mime=ALLOWED_IMAGE_TYPES,
+    )
+    if media_type == BrandMediaType.logo:
+        db.execute(
+            delete(BrandMedia).where(
+                BrandMedia.brand_id == brand.id,
+                BrandMedia.media_type == BrandMediaType.logo,
+            )
+        )
+    media = BrandMedia(
+        brand_id=brand.id,
+        media_type=media_type,
+        file_path=relative_path,
+        mime_type=mime_type,
+        original_filename=file.filename,
+        sort_order=sort_order,
+    )
+    db.add(media)
+    db.commit()
+    db.refresh(media)
+    return BrandMediaUploadResponse(media=media_to_read(media))
+
+
+@router.post(
+    "/franchise-owner/brand/fdd",
+    response_model=BrandFDDUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+async def upload_brand_fdd(
+    file: UploadFile = File(...),
+    title: str = Form(..., min_length=1, max_length=255),
+    version: Optional[str] = Form(default=None, max_length=64),
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    brand = get_owned_brand_or_404(db, current_user)
+    relative_path, mime_type, size = save_upload_file(
+        file,
+        subdir=f"brands/{brand.id}/fdd",
+        allowed_mime=ALLOWED_PDF_TYPES,
+    )
+    doc = BrandFDDDocument(
+        brand_id=brand.id,
+        title=title.strip(),
+        version=version.strip() if version else None,
+        file_path=relative_path,
+        mime_type=mime_type,
+        file_size_bytes=size,
+        published_at=datetime.utcnow(),
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+    return BrandFDDUploadResponse(document=BrandFDDRead.model_validate(doc))
+
+
 @router.get(
     "/applications/my-brand",
     response_model=ApplicationListEnvelope,
     dependencies=[Depends(require_roles(UserRole.franchise_owner))],
 )
 def list_my_brand_applications(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     brand = get_owned_brand_optional(db, current_user)
     if brand is None:
-        return ApplicationListEnvelope(items=[])
-    rows = db.scalars(
+        meta = paginated_meta(0, page, page_size)
+        return ApplicationListEnvelope(items=[], **meta)
+    stmt = (
         select(Application)
         .where(Application.brand_id == brand.id)
         .order_by(Application.created_at.desc(), Application.id.desc())
-    ).all()
-    return ApplicationListEnvelope(items=rows)
+    )
+    total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    offset = (page - 1) * page_size
+    rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
+    meta = paginated_meta(total, page, page_size)
+    return ApplicationListEnvelope(items=list(rows), **meta)
 
 
 @router.patch(
@@ -293,87 +386,3 @@ def update_application_status(
     db.refresh(application)
     return application
 
-
-@router.post("/messages", response_model=MessageRead, status_code=status.HTTP_201_CREATED)
-def create_message(
-    payload: MessageCreate,
-    db: Session = Depends(get_db),
-    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
-):
-    if current_user.role not in {UserRole.franchise_owner, UserRole.buyer}:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only buyers and franchise owners can send messages",
-        )
-
-    application = db.get(Application, payload.application_id)
-    if not application:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Application not found",
-        )
-    if application.status != ApplicationStatus.approved:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Messaging is only available for approved applications",
-        )
-
-    if current_user.role == UserRole.buyer and application.buyer_id != current_user.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not part of this application",
-        )
-    if current_user.role == UserRole.franchise_owner:
-        brand = get_owned_brand_or_404(db, current_user)
-        if application.brand_id != brand.id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="You are not part of this application",
-            )
-
-    message = Message(
-        application_id=payload.application_id,
-        sender_role=current_user.role,
-        sender_id=current_user.user_id,
-        content=payload.content,
-    )
-    db.add(message)
-    db.commit()
-    db.refresh(message)
-    return message
-
-
-@router.get("/messages/{application_id}", response_model=list[MessageRead])
-def list_messages(
-    application_id: int,
-    db: Session = Depends(get_db),
-    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
-):
-    application = db.get(Application, application_id)
-    if not application:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Application not found",
-        )
-
-    allowed = False
-    if current_user.role == UserRole.buyer and application.buyer_id == current_user.user_id:
-        allowed = True
-    elif current_user.role == UserRole.franchise_owner:
-        brand = db.scalar(
-            select(Brand).where(Brand.franchise_owner_id == current_user.user_id)
-        )
-        if brand and brand.id == application.brand_id:
-            allowed = True
-
-    if not allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You are not allowed to view these messages",
-        )
-
-    return db.scalars(
-        select(Message)
-        .where(Message.application_id == application_id)
-        .order_by(Message.created_at.asc())
-    ).all()
