@@ -13,7 +13,8 @@ from ..messaging_service import (
     mark_all_messages_read_for_application,
     mark_message_read,
 )
-from ..models import Application, ApplicationStatus, Brand, Message, UserRole
+from ..models import Application, ApplicationStatus, Brand, Buyer, Message, UserRole
+from ..notification_events import notify_new_message
 from ..schemas import (
     AuthenticatedPrincipal,
     ConversationsResponse,
@@ -62,6 +63,17 @@ def create_message(
         content=payload.content,
     )
     db.add(message)
+    db.flush()
+    brand = db.get(Brand, application.brand_id)
+    buyer = db.get(Buyer, application.buyer_id)
+    if brand and buyer:
+        notify_new_message(
+            db,
+            message=message,
+            application=application,
+            brand=brand,
+            buyer=buyer,
+        )
     db.commit()
     db.refresh(message)
     from ..messaging_service import message_to_read

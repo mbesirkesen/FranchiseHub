@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..dependencies import get_current_principal, require_roles
 from ..inventory_service import list_low_stock_items, transfer_between_outlets
+from ..notification_events import notify_low_stock
 from ..models import (
     Inventory,
     SupplyRequest,
@@ -100,6 +101,9 @@ def update_inventory_item(
             detail="Inventory item not found",
         )
 
+    prev_stock = item.stock_level
+    prev_threshold = item.low_stock_threshold
+
     if payload.item_name is not None:
         item.item_name = payload.item_name
     if payload.stock_level is not None:
@@ -108,6 +112,13 @@ def update_inventory_item(
         item.outlet_id = payload.outlet_id
     if payload.low_stock_threshold is not None:
         item.low_stock_threshold = payload.low_stock_threshold
+
+    was_above = prev_stock > prev_threshold
+    now_low = item.stock_level <= item.low_stock_threshold
+    if was_above and now_low:
+        notify_low_stock(
+            db, item=item, franchise_owner_id=current_user.user_id
+        )
 
     db.commit()
     db.refresh(item)

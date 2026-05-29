@@ -13,7 +13,8 @@ from ..application_access import (
 from ..application_timeline import build_application_timeline
 from ..database import get_db
 from ..dependencies import get_current_principal, require_roles
-from ..models import Application, ApplicationStatus, Brand, UserRole
+from ..models import Application, ApplicationStatus, Brand, Buyer, UserRole
+from ..notification_events import notify_new_application
 from ..pagination import paginated_meta
 from ..schemas import (
     ApplicationDetailResponse,
@@ -59,6 +60,12 @@ def create_application(
         notes=payload.notes,
     )
     db.add(application)
+    db.flush()
+    buyer = db.get(Buyer, current_user.user_id)
+    if buyer:
+        notify_new_application(
+            db, application=application, brand=brand, buyer=buyer
+        )
     db.commit()
     db.refresh(application)
     return application

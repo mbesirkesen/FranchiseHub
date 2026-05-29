@@ -149,15 +149,19 @@ def list_conversations(
             .order_by(Application.created_at.desc(), Application.id.desc())
         ).all()
     else:
-        brand = db.scalar(
-            select(Brand).where(Brand.franchise_owner_id == principal.user_id)
+        brand_ids = list(
+            db.scalars(
+                select(Brand.id).where(
+                    Brand.franchise_owner_id == principal.user_id
+                )
+            ).all()
         )
-        if not brand:
+        if not brand_ids:
             return ConversationsResponse(items=[])
         apps = db.scalars(
             select(Application)
             .where(
-                Application.brand_id == brand.id,
+                Application.brand_id.in_(brand_ids),
                 Application.status == ApplicationStatus.approved,
             )
             .order_by(Application.created_at.desc(), Application.id.desc())

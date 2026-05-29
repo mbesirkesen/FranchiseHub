@@ -15,6 +15,7 @@ from ..models import (
     Application,
     ApplicationStatus,
     Brand,
+    Buyer,
     BrandFDDDocument,
     BrandMedia,
     BrandMediaType,
@@ -35,17 +36,28 @@ from ..schemas import (
     FranchiseOwnerBrandWrite,
     FranchiseOwnerDashboardSummary,
 )
+from ..notification_events import notify_application_status_change
 from ..pagination import paginated_meta
 from ..storage import ALLOWED_IMAGE_TYPES, ALLOWED_PDF_TYPES, save_upload_file
 
 router = APIRouter(tags=["franchise-owner"])
 
 
+def get_owned_brand_ids(db: Session, current_user: AuthenticatedPrincipal) -> list[int]:
+    return list(
+        db.scalars(
+            select(Brand.id).where(Brand.franchise_owner_id == current_user.user_id)
+        ).all()
+    )
+
+
 def get_owned_brand_optional(
     db: Session, current_user: AuthenticatedPrincipal
 ) -> Brand | None:
     return db.scalar(
-        select(Brand).where(Brand.franchise_owner_id == current_user.user_id)
+        select(Brand)
+        .where(Brand.franchise_owner_id == current_user.user_id)
+        .order_by(Brand.id.asc())
     )
 
 
@@ -345,13 +357,13 @@ def list_my_brand_applications(
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    brand = get_owned_brand_optional(db, current_user)
-    if brand is None:
+    brand_ids = get_owned_brand_ids(db, current_user)
+    if not brand_ids:
         meta = paginated_meta(0, page, page_size)
         return ApplicationListEnvelope(items=[], **meta)
     stmt = (
         select(Application)
-        .where(Application.brand_id == brand.id)
+        .where(Application.brand_id.in_(brand_ids))
         .order_by(Application.created_at.desc(), Application.id.desc())
     )
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
@@ -382,6 +394,18 @@ def update_application_status(
     application.status = payload.status
     if payload.notes is not None:
         application.notes = payload.notes
+
+    brand = db.get(Brand, application.brand_id)
+    buyer = db.get(Buyer, application.buyer_id)
+    if brand and buyer:
+        notify_application_status_change(
+            db,
+            application=application,
+            brand=brand,
+            buyer=buyer,
+            new_status=payload.status,
+        )
+
     db.commit()
     db.refresh(application)
     return application
