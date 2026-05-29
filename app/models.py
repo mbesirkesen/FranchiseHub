@@ -9,6 +9,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -93,6 +94,9 @@ class Buyer(Base, UserCredentialsMixin):
 
     applications = relationship("Application", back_populates="buyer")
     favorites = relationship("BuyerFavorite", back_populates="buyer", cascade="all, delete-orphan")
+    agent_sessions = relationship(
+        "AgentSession", back_populates="buyer", cascade="all, delete-orphan"
+    )
 
 
 class BuyerFavorite(Base):
@@ -410,3 +414,41 @@ class MessageReadReceipt(Base):
     read_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     message = relationship("Message", back_populates="read_receipts")
+
+
+class AgentMessageRole(str, enum.Enum):
+    user = "user"
+    assistant = "assistant"
+
+
+class AgentSession(Base):
+    __tablename__ = "agent_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    buyer_id = Column(Integer, ForeignKey("buyers.id"), nullable=False, index=True)
+    title = Column(String(200), nullable=True)
+    brand_context_id = Column(Integer, ForeignKey("brands.id"), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    buyer = relationship("Buyer", back_populates="agent_sessions")
+    messages = relationship(
+        "AgentMessage", back_populates="session", cascade="all, delete-orphan", order_by="AgentMessage.created_at"
+    )
+
+
+class AgentMessage(Base):
+    __tablename__ = "agent_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("agent_sessions.id"), nullable=False, index=True)
+    role = Column(String(16), nullable=False)
+    content = Column(Text, nullable=False)
+    intent = Column(String(64), nullable=True)
+    source = Column(String(16), nullable=False, default="rules")
+    filters_applied = Column(JSON, nullable=True)
+    related_brand_ids = Column(JSON, nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    session = relationship("AgentSession", back_populates="messages")

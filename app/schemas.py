@@ -1172,6 +1172,14 @@ class SearchResponse(BaseModel):
 class AssistantQueryRequest(BaseModel):
     query: str = Field(min_length=2, max_length=2000)
     brand_id: Optional[int] = None
+    brand_context_id: Optional[int] = None
+    session_id: Optional[int] = None
+
+
+class AssistantChatRequest(AssistantQueryRequest):
+    """Sohbet oturumu — session_id yoksa yeni oturum açılır."""
+
+    new_session: bool = False
 
 
 class AssistantSuggestion(BaseModel):
@@ -1181,14 +1189,26 @@ class AssistantSuggestion(BaseModel):
     match_score: Optional[int] = None
 
 
+class AssistantBrandRead(BrandRead):
+    """Agent widget — ROI ve eşleşme skoru dahil."""
+
+    estimated_roi_percent: Optional[float] = None
+    match_score: Optional[int] = None
+    match_reasons: list[str] = Field(default_factory=list)
+
+
 class AssistantQueryResponse(BaseModel):
     answer: str
     intent: str = "general"
     suggestions: list[AssistantSuggestion] = Field(default_factory=list)
-    related_brands: list[BrandRead] = Field(default_factory=list)
+    related_brands: list[AssistantBrandRead] = Field(default_factory=list)
     related_brand_ids: list[int] = Field(default_factory=list)
     filters_applied: dict[str, object] = Field(default_factory=dict)
     source: str = "rules"
+    session_id: Optional[int] = None
+    message_id: Optional[int] = None
+    latency_ms: Optional[int] = None
+    compare: Optional[BrandCompareResponse] = None
 
     @computed_field
     @property
@@ -1197,8 +1217,35 @@ class AssistantQueryResponse(BaseModel):
 
     @computed_field
     @property
-    def brands(self) -> list[BrandRead]:
+    def brands(self) -> list[AssistantBrandRead]:
         return self.related_brands
+
+
+class AgentSessionRead(BaseModel):
+    id: int
+    title: Optional[str] = None
+    brand_context_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+    message_count: int = 0
+    last_message_preview: Optional[str] = None
+
+
+class AgentMessageRead(BaseModel):
+    id: int
+    session_id: int
+    role: str
+    content: str
+    intent: Optional[str] = None
+    source: str = "rules"
+    filters_applied: Optional[dict[str, object]] = None
+    related_brand_ids: Optional[list[int]] = None
+    created_at: datetime
+
+
+class AgentSessionDetailResponse(BaseModel):
+    session: AgentSessionRead
+    messages: list[AgentMessageRead] = Field(default_factory=list)
 
 
 class TimelineStepStatus(str, enum.Enum):

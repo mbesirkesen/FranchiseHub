@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..buyer_assistant import answer_buyer_assistant
+from ..agent_service import run_agent_query_only
 from ..buyer_service import recommend_brands
 from ..database import get_db
 from ..dependencies import get_current_principal, require_roles
@@ -281,7 +281,7 @@ def _assistant_handler(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Buyer not found",
         )
-    return answer_buyer_assistant(db, buyer, payload)
+    return run_agent_query_only(db, buyer, payload)
 
 
 @router.post(

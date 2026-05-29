@@ -20,7 +20,7 @@ from .schemas import BrandGrowthPoint, BrandMetricsResponse
 from .security import utc_now
 
 
-def _estimated_roi_percent(brand_id: int, initial_cost: float, approved_count: int) -> float:
+def estimated_roi_percent(brand_id: int, initial_cost: float, approved_count: int) -> float:
     base = 12.0 + (brand_id % 11) * 0.9
     if initial_cost > 3_000_000:
         base -= 1.5
@@ -48,6 +48,28 @@ def _growth_series(db: Session, brand_id: int) -> list[BrandGrowthPoint]:
         value = round(8.0 + (brand_id % 7) + count * 1.4 + (11 - i) * 0.3, 1)
         points.append(BrandGrowthPoint(month=month_key, value=value))
     return points
+
+
+def batch_estimated_roi_percent(db: Session, brands: list) -> dict[int, float]:
+    """N+1 önlemek için agent widget ROI hesabı."""
+    if not brands:
+        return {}
+    ids = [b.id for b in brands]
+    rows = db.execute(
+        select(Application.brand_id, func.count(Application.id))
+        .where(
+            Application.brand_id.in_(ids),
+            Application.status == ApplicationStatus.approved,
+        )
+        .group_by(Application.brand_id)
+    ).all()
+    approved_counts = {int(bid): int(cnt) for bid, cnt in rows}
+    return {
+        b.id: estimated_roi_percent(
+            b.id, float(b.initial_cost), approved_counts.get(b.id, 0)
+        )
+        for b in brands
+    }
 
 
 def build_brand_metrics(db: Session, brand_id: int) -> BrandMetricsResponse:
@@ -122,7 +144,7 @@ def build_brand_metrics(db: Session, brand_id: int) -> BrandMetricsResponse:
     gallery_count = sum(1 for m in media_rows if m.media_type == BrandMediaType.gallery)
 
     initial_cost = float(brand.initial_cost)
-    roi = _estimated_roi_percent(brand.id, initial_cost, applications_approved)
+    roi = estimated_roi_percent(brand.id, initial_cost, applications_approved)
 
     return BrandMetricsResponse(
         brand_id=brand.id,

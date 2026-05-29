@@ -41,7 +41,9 @@ Bu doküman, web/mobil arayüzdeki her özelliğin hangi API’ye bağlanacağı
 | Başvuru detay | GET | `/buyer/applications/{id}` | |
 | Dashboard özet | GET | `/buyer/dashboard/summary` | |
 | Uygunluk / discover | POST | `/buyer/qualification` | `match_score`, `match_reasons` |
-| **Franchise Asistanı** | POST | `/buyer/assistant` veya `/buyer/assistant/query` veya `/agent/query` | `reply`, `brands`, `filters_applied` |
+| **Franchise Asistanı (sohbet)** | POST | `/agent/chat` | `session_id`, `message_id`, `answer`, `brands`, `suggestions` |
+| **Franchise Asistanı (tek tur)** | POST | `/agent/query` veya `/buyer/assistant` | `reply`, `brands`, `filters_applied`, `compare` |
+| **Asistan oturumları** | GET/DELETE | `/agent/sessions`, `/agent/sessions/{id}` | Mesaj geçmişi |
 | Başvuru oluştur | POST | `/applications` | |
 | Başvurularım (mesajlı) | GET | `/applications/mine` | `unread_count` |
 | Başvuru detay | GET | `/applications/{id}` | `extended_status` |
