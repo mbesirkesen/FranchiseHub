@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .agent_vocabulary import AgentVocabulary, load_agent_vocabulary
 from .models import Application, Brand, Buyer, BuyerFavorite
 
 
@@ -16,6 +17,7 @@ class AgentBuyerContext:
     applied_brand_ids: list[int] = field(default_factory=list)
     recent_turns: list[tuple[str, str]] = field(default_factory=list)  # (role, content)
     last_search_state: Optional[dict] = None  # {filters_applied, related_brand_ids}
+    vocabulary: Optional[AgentVocabulary] = None
 
 
 def load_buyer_context(db: Session, buyer: Buyer) -> AgentBuyerContext:
@@ -34,6 +36,7 @@ def load_buyer_context(db: Session, buyer: Buyer) -> AgentBuyerContext:
     return AgentBuyerContext(
         favorite_brand_ids=favorite_ids,
         applied_brand_ids=applied_ids,
+        vocabulary=load_agent_vocabulary(db),
     )
 
 

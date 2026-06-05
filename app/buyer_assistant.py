@@ -11,7 +11,10 @@ from .agent_context import AgentBuyerContext, favorite_brands
 from .agent_llm import maybe_enhance_answer
 from .agent_nlu import (
     AgentSearchFilters,
+    _detect_ordinal_index,
+    _detect_pick_mode,
     _normalize,
+    build_profile_recommendation_filters,
     classify_intent,
     extract_brand_name_tokens,
     filters_applied_dict,
@@ -59,9 +62,14 @@ def _rank_agent_brands(
             continue
         roi = roi_map.get(brand.id, 0.0)
         composite = match_score + min(roi, 30) * 0.5
-        scored.append((brand, match_score, reasons, composite))
-    scored.sort(key=lambda x: (-x[3], float(x[0].initial_cost)))
-    return scored
+        scored.append((brand, match_score, reasons, composite, roi))
+    if filters.sort == "roi_desc":
+        scored.sort(key=lambda x: (-x[4], -x[1], float(x[0].initial_cost)))
+    elif filters.sort == "cost_desc":
+        scored.sort(key=lambda x: (-float(x[0].initial_cost), -x[1]))
+    else:
+        scored.sort(key=lambda x: (-x[3], float(x[0].initial_cost)))
+    return [(b, ms, rs, comp) for b, ms, rs, comp, _ in scored]
 
 
 def _to_assistant_brand(
@@ -129,7 +137,7 @@ def _build_brand_search_answer(
     if count == 0:
         return (
             f"Bu kriterlerle eşleşen marka bulamadım ({human}). "
-            "Farklı bir soru deneyin; örneğin sektör, bölge veya bütçe belirtebilirsiniz."
+            "Bütçeyi artırabilir, farklı sektör deneyebilir veya «bana uygun marka öner» yazabilirsiniz."
         )
     if filters.use_profile_budget:
         return (
@@ -183,12 +191,108 @@ def _search_brands_for_agent(
     return assistant_brands, ids
 
 
+def _search_brands_by_ids(
+    db: Session,
+    buyer: Buyer,
+    brand_ids: list[int],
+    ctx: AgentBuyerContext,
+    filters: AgentSearchFilters,
+) -> tuple[list[AssistantBrandRead], list[int]]:
+    if not brand_ids:
+        return [], []
+    rows = list(
+        db.scalars(
+            select(Brand).where(
+                Brand.id.in_(brand_ids),
+                Brand.is_approved.is_(True),
+            )
+        ).all()
+    )
+    exclude = ctx.exclude_brand_ids
+    if filters.exclude_applied:
+        exclude = exclude | set(ctx.applied_brand_ids)
+    rows = [b for b in rows if b.id not in exclude]
+    order = {bid: i for i, bid in enumerate(brand_ids)}
+    rows.sort(key=lambda b: order.get(b.id, 999))
+    roi_map = batch_estimated_roi_percent(db, rows)
+    ranked = _rank_agent_brands(rows, buyer=buyer, filters=filters, roi_map=roi_map)[
+        :AGENT_RESULT_LIMIT
+    ]
+    assistant_brands: list[AssistantBrandRead] = []
+    ids: list[int] = []
+    for brand, match_score, reasons, _ in ranked:
+        assistant_brands.append(
+            _to_assistant_brand(
+                brand,
+                match_score=match_score,
+                match_reasons=reasons,
+                estimated_roi_percent=roi_map.get(brand.id, 12.0),
+            )
+        )
+        ids.append(brand.id)
+    return assistant_brands, ids
+
+
+def _search_with_relaxed_filters(
+    db: Session,
+    buyer: Buyer,
+    filters: AgentSearchFilters,
+    ctx: AgentBuyerContext,
+) -> tuple[list[AssistantBrandRead], list[int], AgentSearchFilters]:
+    brands, ids = _search_brands_for_agent(db, buyer, filters, ctx)
+    if brands:
+        return brands, ids, filters
+
+    relaxed = AgentSearchFilters(**{k: v for k, v in filters.__dict__.items()})
+    if relaxed.q:
+        relaxed.q = None
+        brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
+        if brands:
+            return brands, ids, relaxed
+
+    if relaxed.max_cost is not None:
+        relaxed.max_cost = relaxed.max_cost * 1.2
+        relaxed.min_cost = None
+        brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
+        if brands:
+            return brands, ids, relaxed
+
+    if relaxed.sector:
+        relaxed.sector = None
+        relaxed.use_profile_sector = False
+        brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
+        if brands:
+            return brands, ids, relaxed
+
+    return [], [], filters
+
+
+def _try_resolve_single_brand(
+    db: Session, norm: str, vocabulary=None
+) -> Optional[Brand]:
+    if vocabulary:
+        ids = vocabulary.match_brand_ids(norm, limit=1)
+        if len(ids) == 1:
+            return db.get(Brand, ids[0])
+    for name in extract_brand_name_tokens(norm):
+        resolved = _resolve_brands_by_names(db, [name])
+        if len(resolved) == 1:
+            return resolved[0]
+    tokens = [t for t in re.split(r"\s+", norm) if len(t) >= 4]
+    for token in tokens:
+        resolved = _resolve_brands_by_names(db, [token.capitalize()])
+        if len(resolved) == 1:
+            return resolved[0]
+    return None
+
+
 def _pick_from_previous_brands(
     db: Session,
     buyer: Buyer,
     *,
     brand_ids: list[int],
     pick_mode: str,
+    pick_index: Optional[int] = None,
 ) -> AssistantQueryResponse:
     rows = list(
         db.scalars(
@@ -222,11 +326,22 @@ def _pick_from_previous_brands(
     elif pick_mode == "expensive":
         scored.sort(key=lambda x: -x[3])
         label = "En yüksek yatırım gerektiren"
+    elif pick_mode == "best_roi":
+        scored.sort(key=lambda x: (-roi_map.get(x[0].id, 0.0), -x[1]))
+        label = "En yüksek ROI'li"
+    elif pick_mode == "ordinal" and pick_index is not None:
+        scored.sort(key=lambda x: x[3])
+        label = "Seçtiğiniz"
     else:
         scored.sort(key=lambda x: (-x[1], x[3]))
         label = "Profilinize en uygun"
 
-    chosen, match_score, reasons, cost = scored[0]
+    idx = 0
+    if pick_mode == "ordinal" and pick_index is not None:
+        idx = pick_index if pick_index >= 0 else len(scored) - 1
+        idx = max(0, min(idx, len(scored) - 1))
+
+    chosen, match_score, reasons, cost = scored[idx]
     assistant = _to_assistant_brand(
         chosen,
         match_score=match_score,
@@ -512,7 +627,9 @@ def _maybe_llm_polish(
     buyer: Buyer,
     filters: Optional[AgentSearchFilters] = None,
 ) -> AssistantQueryResponse:
-    if response.intent not in ("brand_search", "favorites_similar", "brand_detail", "no_match"):
+    if response.intent not in (
+        "brand_search", "favorites_similar", "brand_detail", "brand_pick", "no_match",
+    ):
         return response
     human = filters_human_label(
         filters or AgentSearchFilters(),
@@ -560,6 +677,7 @@ def answer_buyer_assistant(
         payload.query,
         buyer,
         previous_search=context.last_search_state,
+        vocabulary=context.vocabulary,
     )
     intent = nlu.intent
 
@@ -582,7 +700,11 @@ def answer_buyer_assistant(
     if intent == "brand_pick" and nlu.pick_mode and context.last_search_state:
         prev_ids = context.last_search_state.get("related_brand_ids") or []
         resp = _pick_from_previous_brands(
-            db, buyer, brand_ids=prev_ids, pick_mode=nlu.pick_mode
+            db,
+            buyer,
+            brand_ids=prev_ids,
+            pick_mode=nlu.pick_mode,
+            pick_index=nlu.pick_index,
         )
         resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
         resp.latency_ms = int((time.perf_counter() - started) * 1000)
@@ -590,7 +712,9 @@ def answer_buyer_assistant(
 
     if intent == "general":
         norm = _normalize(payload.query)
-        if any(norm.startswith(g) or norm == g for g in ("merhaba", "selam", "naber", "nasilsin", "nasılsın")):
+        if any(norm.startswith(g) or norm == g for g in ("tesekkur", "teşekkür", "sagol", "sağol", "eyvallah")):
+            answer = "Rica ederim! Başka bir sorunuz olursa buradayım."
+        elif any(norm.startswith(g) or norm == g for g in ("merhaba", "selam", "naber", "nasilsin", "nasılsın", "hey", "hello")):
             answer = (
                 "Merhaba! FranchiseHub asistanıyım — bütçe, sektör veya şehir söyleyerek "
                 "marka önerebilirim. Örnek: «500 bin TL altı gıda» veya «bana uygun marka öner»."
@@ -611,16 +735,39 @@ def answer_buyer_assistant(
 
     if intent == "no_match":
         norm = _normalize(payload.query)
-        if any(h in norm for h in ("hakkinda", "hakkında", "detay", "bilgi")):
-            for name in extract_brand_name_tokens(norm):
-                resolved = _resolve_brands_by_names(db, [name])
-                if len(resolved) == 1:
-                    resp = _brand_detail_answer(db, buyer, resolved[0].id)
-                    resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
-                    resp.latency_ms = int((time.perf_counter() - started) * 1000)
-                    return resp
+        pick_mode = _detect_pick_mode(norm)
+        if pick_mode and context.last_search_state:
+            prev_ids = context.last_search_state.get("related_brand_ids") or []
+            if prev_ids:
+                pick_index = _detect_ordinal_index(norm) if pick_mode == "ordinal" else None
+                resp = _pick_from_previous_brands(
+                    db,
+                    buyer,
+                    brand_ids=prev_ids,
+                    pick_mode=pick_mode,
+                    pick_index=pick_index,
+                )
+                resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
+                resp.latency_ms = int((time.perf_counter() - started) * 1000)
+                return resp
+        brand = _try_resolve_single_brand(db, norm, context.vocabulary)
+        if brand and any(h in norm for h in ("hakkinda", "hakkında", "detay", "bilgi", "nedir")):
+            resp = _brand_detail_answer(db, buyer, brand.id)
+            resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
+            resp.latency_ms = int((time.perf_counter() - started) * 1000)
+            return resp
+        if brand and len(norm.split()) <= 4:
+            resp = _brand_detail_answer(db, buyer, brand.id)
+            resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
+            resp.latency_ms = int((time.perf_counter() - started) * 1000)
+            return resp
         if any(h in norm for h in ("oner", "öner", "tavsiye", "uygun")):
-            nlu = parse_agent_query(payload.query, buyer, previous_search=context.last_search_state)
+            nlu = parse_agent_query(
+                payload.query,
+                buyer,
+                previous_search=context.last_search_state,
+                vocabulary=context.vocabulary,
+            )
             nlu.intent = "brand_search"
             nlu.filters.use_profile_budget = True
             nlu.filters.max_cost = float(buyer.investment_budget)
@@ -644,6 +791,36 @@ def answer_buyer_assistant(
                 resp.latency_ms = int((time.perf_counter() - started) * 1000)
                 return resp
 
+        if any(h in norm for h in ("tesekkur", "teşekkür", "sagol", "sağol", "eyvallah", "tamam")):
+            return AssistantQueryResponse(
+                answer="Rica ederim! Başka bir sorunuz olursa buradayım.",
+                intent="general",
+                suggestions=_refine_suggestions(),
+                source="rules",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+        profile_filters = build_profile_recommendation_filters(buyer)
+        brands, brand_ids, used_filters = _search_with_relaxed_filters(
+            db, buyer, profile_filters, context
+        )
+        if brands and len(norm.split()) >= 2:
+            resp = AssistantQueryResponse(
+                answer=(
+                    "Tam eşleşme bulamadım; profilinize yakın "
+                    + _build_brand_search_answer(filters=used_filters, buyer=buyer, count=len(brands))
+                ),
+                intent="brand_search",
+                suggestions=_default_suggestions(brands),
+                related_brands=brands,
+                related_brand_ids=brand_ids,
+                filters_applied=filters_applied_dict(used_filters),
+                source="rules",
+            )
+            resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=used_filters)
+            resp.latency_ms = int((time.perf_counter() - started) * 1000)
+            return resp
+
         return AssistantQueryResponse(
             answer=(
                 "Sorunuzu tam anlayamadım. Bütçe (ör. 500 bin TL), sektör (gıda, kahve), "
@@ -658,9 +835,21 @@ def answer_buyer_assistant(
     if nlu.filters.exclude_applied:
         context.exclude_brand_ids |= set(context.applied_brand_ids)
 
-    brands, brand_ids = _search_brands_for_agent(db, buyer, nlu.filters, context)
+    if nlu.db_brand_ids:
+        brands, brand_ids = _search_brands_by_ids(
+            db, buyer, nlu.db_brand_ids, context, nlu.filters
+        )
+        used_filters = nlu.filters
+        if not brands:
+            brands, brand_ids, used_filters = _search_with_relaxed_filters(
+                db, buyer, nlu.filters, context
+            )
+    else:
+        brands, brand_ids, used_filters = _search_with_relaxed_filters(
+            db, buyer, nlu.filters, context
+        )
     answer = _build_brand_search_answer(
-        filters=nlu.filters, buyer=buyer, count=len(brands)
+        filters=used_filters, buyer=buyer, count=len(brands)
     )
     suggestions = _default_suggestions(brands)
     if not brands:
@@ -672,9 +861,9 @@ def answer_buyer_assistant(
         suggestions=suggestions,
         related_brands=brands,
         related_brand_ids=brand_ids,
-        filters_applied=filters_applied_dict(nlu.filters),
+        filters_applied=filters_applied_dict(used_filters),
         source="rules",
     )
-    resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=nlu.filters)
+    resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=used_filters)
     resp.latency_ms = int((time.perf_counter() - started) * 1000)
     return resp
