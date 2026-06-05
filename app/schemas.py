@@ -895,6 +895,10 @@ class SupplyRequestRead(SupplyRequestBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    outlet_id: Optional[int] = None
+    buyer_id: Optional[int] = None
+    outlet_name: Optional[str] = None
+    buyer_name: Optional[str] = None
     notes: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -918,6 +922,14 @@ class SupplyRequestListEnvelope(BaseModel):
 
 
 class SupplyRequestItemCreate(BaseModel):
+    product_name: str
+    quantity: int = Field(gt=0)
+    outlet_id: Optional[int] = None
+
+
+class BuyerSupplyRequestCreate(BaseModel):
+    brand_id: int
+    outlet_id: int
     product_name: str
     quantity: int = Field(gt=0)
 

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -9,6 +10,8 @@ from ..dependencies import get_current_principal, require_roles
 from ..inventory_service import list_low_stock_items, transfer_between_outlets
 from ..notification_events import notify_low_stock
 from ..models import (
+    Buyer,
+    FranchiseOutlet,
     Inventory,
     SupplyRequest,
     SupplyRequestStatus,
@@ -36,6 +39,33 @@ from ..supply_service import get_supply_request_for_owner, update_supply_request
 router = APIRouter(tags=["protected"])
 
 
+def _supply_request_to_read(db: Session, row: SupplyRequest) -> SupplyRequestRead:
+    outlet_name: Optional[str] = None
+    buyer_name: Optional[str] = None
+    if row.outlet_id:
+        outlet = db.get(FranchiseOutlet, row.outlet_id)
+        outlet_name = outlet.name if outlet else None
+    if row.buyer_id:
+        buyer = db.get(Buyer, row.buyer_id)
+        if buyer:
+            parts = [buyer.first_name or "", buyer.last_name or ""]
+            buyer_name = " ".join(p for p in parts if p).strip() or buyer.email
+    return SupplyRequestRead(
+        id=row.id,
+        franchise_owner_id=row.franchise_owner_id,
+        product_name=row.product_name,
+        quantity=row.quantity,
+        status=row.status,
+        outlet_id=row.outlet_id,
+        buyer_id=row.buyer_id,
+        outlet_name=outlet_name,
+        buyer_name=buyer_name,
+        notes=row.notes,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 @router.get(
     "/inventory",
     response_model=InventoryListEnvelope,
@@ -44,14 +74,18 @@ router = APIRouter(tags=["protected"])
 def list_my_inventory(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
+    scope: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    stmt = (
-        select(Inventory)
-        .where(Inventory.franchise_owner_id == current_user.user_id)
-        .order_by(Inventory.id.desc())
+    stmt = select(Inventory).where(
+        Inventory.franchise_owner_id == current_user.user_id
     )
+    if scope == "center":
+        stmt = stmt.where(Inventory.outlet_id.is_(None))
+    elif scope == "outlet":
+        stmt = stmt.where(Inventory.outlet_id.isnot(None))
+    stmt = stmt.order_by(Inventory.id.desc())
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
     offset = (page - 1) * page_size
     result = db.scalars(stmt.offset(offset).limit(page_size)).all()
@@ -186,10 +220,11 @@ def transfer_inventory(
 def list_low_stock(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
+    scope: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    all_items = list_low_stock_items(db, current_user.user_id)
+    all_items = list_low_stock_items(db, current_user.user_id, scope=scope)
     total = len(all_items)
     start = (page - 1) * page_size
     items = all_items[start : start + page_size]
@@ -205,50 +240,22 @@ def list_low_stock(
 def list_my_supply_requests(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    source: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    stmt = (
-        select(SupplyRequest)
-        .where(SupplyRequest.franchise_owner_id == current_user.user_id)
-        .order_by(SupplyRequest.created_at.desc(), SupplyRequest.id.desc())
+    stmt = select(SupplyRequest).where(
+        SupplyRequest.franchise_owner_id == current_user.user_id
     )
+    if source == "incoming":
+        stmt = stmt.where(SupplyRequest.outlet_id.isnot(None))
+    stmt = stmt.order_by(SupplyRequest.created_at.desc(), SupplyRequest.id.desc())
     total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
     offset = (page - 1) * page_size
     rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
     meta = paginated_meta(total, page, page_size)
-    return SupplyRequestListEnvelope(items=list(rows), **meta)
-
-
-@router.get(
-    "/supply-requests/{request_id}",
-    response_model=SupplyRequestDetailRead,
-    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
-)
-def get_supply_request_detail(
-    request_id: int,
-    db: Session = Depends(get_db),
-    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
-):
-    item = get_supply_request_for_owner(db, request_id, current_user.user_id)
-    return item
-
-
-@router.patch(
-    "/supply-requests/{request_id}",
-    response_model=SupplyRequestDetailRead,
-    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
-)
-def patch_supply_request(
-    request_id: int,
-    payload: SupplyRequestUpdate,
-    db: Session = Depends(get_db),
-    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
-):
-    item = get_supply_request_for_owner(db, request_id, current_user.user_id)
-    return update_supply_request_status(
-        db, item, new_status=payload.status, notes=payload.notes
-    )
+    items = [_supply_request_to_read(db, row) for row in rows]
+    return SupplyRequestListEnvelope(items=items, **meta)
 
 
 @router.post(
@@ -264,10 +271,24 @@ def create_bulk_supply_requests(
 ):
     created_requests: list[SupplyRequest] = []
     for req in payload.requests:
+        outlet_id = req.outlet_id
+        if outlet_id is not None:
+            outlet = db.scalar(
+                select(FranchiseOutlet).where(
+                    FranchiseOutlet.id == outlet_id,
+                    FranchiseOutlet.franchise_owner_id == current_user.user_id,
+                )
+            )
+            if not outlet:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Outlet not found",
+                )
         supply_request = SupplyRequest(
             franchise_owner_id=current_user.user_id,
             product_name=req.product_name,
             quantity=req.quantity,
+            outlet_id=outlet_id,
             status=SupplyRequestStatus.pending,
         )
         db.add(supply_request)
@@ -279,7 +300,7 @@ def create_bulk_supply_requests(
     db.commit()
     for request_item in created_requests:
         db.refresh(request_item)
-    return created_requests
+    return [_supply_request_to_read(db, item) for item in created_requests]
 
 
 @router.get(
@@ -318,4 +339,36 @@ def get_supply_pool(
         )
         for row in rows
     ]
+
+
+@router.get(
+    "/supply-requests/{request_id}",
+    response_model=SupplyRequestDetailRead,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def get_supply_request_detail(
+    request_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    item = get_supply_request_for_owner(db, request_id, current_user.user_id)
+    return item
+
+
+@router.patch(
+    "/supply-requests/{request_id}",
+    response_model=SupplyRequestDetailRead,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def patch_supply_request(
+    request_id: int,
+    payload: SupplyRequestUpdate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    item = get_supply_request_for_owner(db, request_id, current_user.user_id)
+    updated = update_supply_request_status(
+        db, item, new_status=payload.status, notes=payload.notes
+    )
+    return _supply_request_to_read(db, updated)
 

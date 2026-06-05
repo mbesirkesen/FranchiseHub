@@ -14,7 +14,11 @@ from ..models import (
     Brand,
     Buyer,
     BuyerFavorite,
+    FranchiseOutlet,
+    SupplyRequest,
+    SupplyRequestStatus,
     UserRole,
+    OutletStatus,
 )
 from ..pagination import paginated_meta
 from ..schemas import (
@@ -29,7 +33,10 @@ from ..schemas import (
     BuyerFavoritesResponse,
     BuyerQualificationRequest,
     BuyerQualificationResponse,
+    BuyerSupplyRequestCreate,
     BrandRead,
+    FranchiseOutletRead,
+    SupplyRequestRead,
 )
 
 router = APIRouter(prefix="/buyer", tags=["buyer"])
@@ -328,3 +335,131 @@ def buyer_qualification(
         city=payload.city,
     )
     return BuyerQualificationResponse(items=items, matching_engine="rules")
+
+
+def _buyer_supply_to_read(db: Session, row: SupplyRequest) -> SupplyRequestRead:
+    outlet_name = None
+    if row.outlet_id:
+        outlet = db.get(FranchiseOutlet, row.outlet_id)
+        outlet_name = outlet.name if outlet else None
+    buyer = db.get(Buyer, row.buyer_id) if row.buyer_id else None
+    buyer_name = None
+    if buyer:
+        parts = [buyer.first_name or "", buyer.last_name or ""]
+        buyer_name = " ".join(p for p in parts if p).strip() or buyer.email
+    return SupplyRequestRead(
+        id=row.id,
+        franchise_owner_id=row.franchise_owner_id,
+        product_name=row.product_name,
+        quantity=row.quantity,
+        status=row.status,
+        outlet_id=row.outlet_id,
+        buyer_id=row.buyer_id,
+        outlet_name=outlet_name,
+        buyer_name=buyer_name,
+        notes=row.notes,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get(
+    "/supply-requests",
+    response_model=list[SupplyRequestRead],
+    dependencies=[Depends(require_roles(UserRole.buyer))],
+)
+def list_buyer_supply_requests(
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    rows = db.scalars(
+        select(SupplyRequest)
+        .where(SupplyRequest.buyer_id == current_user.user_id)
+        .order_by(SupplyRequest.created_at.desc(), SupplyRequest.id.desc())
+    ).all()
+    return [_buyer_supply_to_read(db, row) for row in rows]
+
+
+@router.post(
+    "/supply-requests",
+    response_model=SupplyRequestRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_roles(UserRole.buyer))],
+)
+def create_buyer_supply_request(
+    payload: BuyerSupplyRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    approved = db.scalar(
+        select(Application).where(
+            Application.buyer_id == current_user.user_id,
+            Application.brand_id == payload.brand_id,
+            Application.status == ApplicationStatus.approved,
+        )
+    )
+    if not approved:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Supply requests require an approved franchise application",
+        )
+    brand = db.get(Brand, payload.brand_id)
+    if not brand or not brand.franchise_owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found",
+        )
+    outlet = db.scalar(
+        select(FranchiseOutlet).where(
+            FranchiseOutlet.id == payload.outlet_id,
+            FranchiseOutlet.franchise_owner_id == brand.franchise_owner_id,
+        )
+    )
+    if not outlet:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Outlet not found for this brand",
+        )
+    row = SupplyRequest(
+        franchise_owner_id=brand.franchise_owner_id,
+        buyer_id=current_user.user_id,
+        outlet_id=payload.outlet_id,
+        product_name=payload.product_name.strip(),
+        quantity=payload.quantity,
+        status=SupplyRequestStatus.pending,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _buyer_supply_to_read(db, row)
+
+
+@router.get(
+    "/brands/{brand_id}/outlets",
+    response_model=list[FranchiseOutletRead],
+    dependencies=[Depends(require_roles(UserRole.buyer))],
+)
+def list_brand_outlets_for_buyer(
+    brand_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    approved = db.scalar(
+        select(Application).where(
+            Application.buyer_id == current_user.user_id,
+            Application.brand_id == brand_id,
+            Application.status == ApplicationStatus.approved,
+        )
+    )
+    if not approved:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Outlet list requires an approved franchise application",
+        )
+    rows = db.scalars(
+        select(FranchiseOutlet).where(
+            FranchiseOutlet.brand_id == brand_id,
+            FranchiseOutlet.status == OutletStatus.active,
+        )
+    ).all()
+    return list(rows)

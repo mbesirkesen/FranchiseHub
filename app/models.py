@@ -288,10 +288,14 @@ class SupplyRequest(Base):
         default=SupplyRequestStatus.pending,
     )
     notes = Column(Text, nullable=True)
+    outlet_id = Column(Integer, ForeignKey("franchise_outlets.id"), nullable=True, index=True)
+    buyer_id = Column(Integer, ForeignKey("buyers.id"), nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     franchise_owner = relationship("FranchiseOwner", back_populates="supply_requests")
+    outlet = relationship("FranchiseOutlet")
+    buyer = relationship("Buyer")
 
 
 class Inventory(Base):

@@ -111,11 +111,14 @@ def transfer_between_outlets(
 
 
 def list_low_stock_items(
-    db: Session, owner_id: int
+    db: Session, owner_id: int, *, scope: Optional[str] = None
 ) -> list[LowStockInventoryItem]:
-    rows = db.scalars(
-        select(Inventory).where(Inventory.franchise_owner_id == owner_id)
-    ).all()
+    stmt = select(Inventory).where(Inventory.franchise_owner_id == owner_id)
+    if scope == "center":
+        stmt = stmt.where(Inventory.outlet_id.is_(None))
+    elif scope == "outlet":
+        stmt = stmt.where(Inventory.outlet_id.isnot(None))
+    rows = db.scalars(stmt).all()
     items: list[LowStockInventoryItem] = []
     for row in rows:
         if row.stock_level < row.low_stock_threshold:
