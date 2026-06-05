@@ -34,6 +34,7 @@ from ..schemas import (
     SupplyRequestUpdate,
 )
 from ..pagination import paginated_meta
+from ..product_utils import normalize_product_name
 from ..supply_service import get_supply_request_for_owner, update_supply_request_status
 
 router = APIRouter(tags=["protected"])
@@ -107,7 +108,7 @@ def create_inventory_item(
     item = Inventory(
         franchise_owner_id=current_user.user_id,
         outlet_id=payload.outlet_id,
-        item_name=payload.item_name,
+        item_name=normalize_product_name(payload.item_name),
         stock_level=payload.stock_level,
         low_stock_threshold=payload.low_stock_threshold,
     )

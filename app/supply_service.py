@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import Inventory, SupplyRequest, SupplyRequestStatus
+from .product_utils import normalize_product_name, product_names_match
 from .schemas import SupplyRequestStatus as SupplyRequestStatusSchema
 
 
@@ -43,28 +44,22 @@ def get_supply_request_for_owner(
     return item
 
 
-def _center_inventory(
-    db: Session, owner_id: int, product_name: str
+def find_inventory_by_product(
+    db: Session,
+    owner_id: int,
+    product_name: str,
+    *,
+    outlet_id: Optional[int],
 ) -> Inventory | None:
-    return db.scalar(
-        select(Inventory).where(
-            Inventory.franchise_owner_id == owner_id,
-            Inventory.item_name == product_name,
-            Inventory.outlet_id.is_(None),
-        )
-    )
-
-
-def _outlet_inventory(
-    db: Session, owner_id: int, product_name: str, outlet_id: int
-) -> Inventory | None:
-    return db.scalar(
-        select(Inventory).where(
-            Inventory.franchise_owner_id == owner_id,
-            Inventory.item_name == product_name,
-            Inventory.outlet_id == outlet_id,
-        )
-    )
+    stmt = select(Inventory).where(Inventory.franchise_owner_id == owner_id)
+    if outlet_id is None:
+        stmt = stmt.where(Inventory.outlet_id.is_(None))
+    else:
+        stmt = stmt.where(Inventory.outlet_id == outlet_id)
+    for row in db.scalars(stmt).all():
+        if product_names_match(row.item_name, product_name):
+            return row
+    return None
 
 
 def apply_supply_to_inventory(db: Session, request: SupplyRequest) -> None:
@@ -73,19 +68,27 @@ def apply_supply_to_inventory(db: Session, request: SupplyRequest) -> None:
     if outlet_id is None:
         return
 
-    center = _center_inventory(db, request.franchise_owner_id, request.product_name)
+    product_name = normalize_product_name(request.product_name)
+    request.product_name = product_name
+
+    center = find_inventory_by_product(
+        db, request.franchise_owner_id, product_name, outlet_id=None
+    )
     if center is None or center.stock_level < request.quantity:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Merkez deposunda yeterli stok yok — önce merkez envanterine ürün ekleyin.",
+            detail=(
+                f"Merkez deposunda “{product_name}” için yeterli stok yok. "
+                "Merkez deposu sekmesinden aynı ürün adıyla stok ekleyin."
+            ),
         )
 
     center.stock_level -= request.quantity
     db.add(center)
 
     threshold = center.low_stock_threshold
-    outlet_row = _outlet_inventory(
-        db, request.franchise_owner_id, request.product_name, outlet_id
+    outlet_row = find_inventory_by_product(
+        db, request.franchise_owner_id, product_name, outlet_id=outlet_id
     )
     if outlet_row:
         outlet_row.stock_level += request.quantity
@@ -96,7 +99,7 @@ def apply_supply_to_inventory(db: Session, request: SupplyRequest) -> None:
         Inventory(
             franchise_owner_id=request.franchise_owner_id,
             outlet_id=outlet_id,
-            item_name=request.product_name,
+            item_name=product_name,
             stock_level=request.quantity,
             low_stock_threshold=threshold,
         )

@@ -15,12 +15,14 @@ from ..models import (
     Buyer,
     BuyerFavorite,
     FranchiseOutlet,
+    Inventory,
     SupplyRequest,
     SupplyRequestStatus,
     UserRole,
     OutletStatus,
 )
 from ..pagination import paginated_meta
+from ..product_utils import normalize_product_name
 from ..schemas import (
     AssistantQueryRequest,
     AssistantQueryResponse,
@@ -36,6 +38,7 @@ from ..schemas import (
     BuyerSupplyRequestCreate,
     BrandRead,
     FranchiseOutletRead,
+    InventoryRead,
     SupplyRequestRead,
 )
 
@@ -424,7 +427,7 @@ def create_buyer_supply_request(
         franchise_owner_id=brand.franchise_owner_id,
         buyer_id=current_user.user_id,
         outlet_id=payload.outlet_id,
-        product_name=payload.product_name.strip(),
+        product_name=normalize_product_name(payload.product_name),
         quantity=payload.quantity,
         status=SupplyRequestStatus.pending,
     )
@@ -461,5 +464,44 @@ def list_brand_outlets_for_buyer(
             FranchiseOutlet.brand_id == brand_id,
             FranchiseOutlet.status == OutletStatus.active,
         )
+    ).all()
+    return list(rows)
+
+
+@router.get(
+    "/brands/{brand_id}/center-inventory",
+    response_model=list[InventoryRead],
+    dependencies=[Depends(require_roles(UserRole.buyer))],
+)
+def list_brand_center_inventory_for_buyer(
+    brand_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    approved = db.scalar(
+        select(Application).where(
+            Application.buyer_id == current_user.user_id,
+            Application.brand_id == brand_id,
+            Application.status == ApplicationStatus.approved,
+        )
+    )
+    if not approved:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Center inventory requires an approved franchise application",
+        )
+    brand = db.get(Brand, brand_id)
+    if not brand or not brand.franchise_owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Brand not found",
+        )
+    rows = db.scalars(
+        select(Inventory)
+        .where(
+            Inventory.franchise_owner_id == brand.franchise_owner_id,
+            Inventory.outlet_id.is_(None),
+        )
+        .order_by(Inventory.item_name.asc(), Inventory.id.asc())
     ).all()
     return list(rows)
