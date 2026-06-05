@@ -1193,8 +1193,19 @@ class AssistantBrandRead(BrandRead):
     """Agent widget — ROI ve eşleşme skoru dahil."""
 
     estimated_roi_percent: Optional[float] = None
-    match_score: Optional[int] = None
+    match_score: Optional[int] = Field(
+        default=None,
+        description="0–100 tam sayı skor; frontend 0–1 için match_score_ratio kullanabilir",
+    )
     match_reasons: list[str] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def match_score_ratio(self) -> Optional[float]:
+        """Frontend örneği (0.87): match_score / 100"""
+        if self.match_score is None:
+            return None
+        return round(self.match_score / 100.0, 2)
 
 
 class AssistantQueryResponse(BaseModel):

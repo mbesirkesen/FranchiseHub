@@ -14,6 +14,7 @@ from .agent_session_store import (
     append_message,
     create_session,
     get_session_for_buyer,
+    last_brand_search_state,
     recent_turns,
 )
 from .buyer_assistant import answer_buyer_assistant
@@ -77,6 +78,7 @@ def _run_agent_turn_inner(
     ctx = load_buyer_context(db, buyer)
     if session:
         ctx.recent_turns = recent_turns(db, session.id, AGENT_CONTEXT_MESSAGE_LIMIT)
+        ctx.last_search_state = last_brand_search_state(db, session.id)
 
     append_message(
         db,

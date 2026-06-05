@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,6 +15,7 @@ class AgentBuyerContext:
     favorite_brand_ids: list[int] = field(default_factory=list)
     applied_brand_ids: list[int] = field(default_factory=list)
     recent_turns: list[tuple[str, str]] = field(default_factory=list)  # (role, content)
+    last_search_state: Optional[dict] = None  # {filters_applied, related_brand_ids}
 
 
 def load_buyer_context(db: Session, buyer: Buyer) -> AgentBuyerContext:

@@ -52,6 +52,49 @@ EXCLUDE_APPLIED_HINTS = (
 )
 TERRITORY_HINTS = ("müsait bölge", "musait bolge", "territory", "bölge var mı", "bolge var mi", "müsaitlik")
 GIBBERISH_MIN_ALPHA = 3
+# classify_intent ile belirlenen niyetler gibberish ile ezilmemeli
+GIBBERISH_EXEMPT_INTENTS = frozenset(
+    {
+        "application_status",
+        "brand_compare",
+        "favorites_similar",
+        "general",
+        "brand_detail",
+        "territory_check",
+    }
+)
+REFINE_HINTS = (
+    "daha ucuz",
+    "daha pahali",
+    "daha pahalı",
+    "daha az",
+    "daha cok",
+    "daha çok",
+    "daha uygun",
+    "bunlar",
+    "bunların",
+    "bunlarin",
+    "aynı",
+    "ayni",
+    "devam",
+    "baska",
+    "başka",
+    "peki ya",
+    "peki",
+    "onun yerine",
+    "bunun disinda",
+    "bunun dışında",
+    "goster",
+    "göster",
+    "olsun",
+    "degil",
+    "değil",
+    "sektor",
+    "sektör",
+    "yerine",
+    "baska sektor",
+    "başka sektör",
+)
 
 
 @dataclass
@@ -159,6 +202,10 @@ def _detect_city(norm: str) -> Optional[str]:
 
 
 def _is_gibberish(norm: str) -> bool:
+    if any(h in norm for h in APPLICATION_HINTS + COMPARE_HINTS + FAVORITES_HINTS + GENERAL_HINTS):
+        return False
+    if any(h in norm for h in REFINE_HINTS):
+        return False
     letters = re.sub(r"[^a-z]", "", norm)
     if len(letters) < GIBBERISH_MIN_ALPHA:
         return True
@@ -234,7 +281,93 @@ def classify_intent(query: str, brand_id: Optional[int]) -> str:
     return "no_match"
 
 
-def parse_agent_query(query: str, buyer: Buyer) -> AgentNluResult:
+def _filters_from_applied(data: Optional[dict]) -> AgentSearchFilters:
+    if not data:
+        return AgentSearchFilters()
+    f = AgentSearchFilters()
+    if data.get("sector"):
+        f.sector = str(data["sector"])
+    if data.get("location"):
+        f.location = str(data["location"])
+    if data.get("region"):
+        f.region = str(data["region"])
+    if data.get("min_cost") is not None:
+        f.min_cost = float(data["min_cost"])
+    if data.get("max_cost") is not None:
+        f.max_cost = float(data["max_cost"])
+    if data.get("q"):
+        f.q = str(data["q"])
+    if data.get("use_profile_budget"):
+        f.use_profile_budget = True
+    if data.get("use_profile_sector"):
+        f.use_profile_sector = True
+    if data.get("use_profile_city"):
+        f.use_profile_city = True
+    if data.get("exclude_applied"):
+        f.exclude_applied = True
+    if data.get("sort"):
+        f.sort = str(data["sort"])
+    return f
+
+
+def _is_refine_follow_up(norm: str) -> bool:
+    return any(h in norm for h in REFINE_HINTS)
+
+
+def _is_context_follow_up(norm: str, previous_search: Optional[dict]) -> bool:
+    """Önceki aramaya bağlı kısa takip sorusu (sektör/şehir değişimi dahil)."""
+    if not previous_search:
+        return False
+    if _is_refine_follow_up(norm):
+        return True
+    if len(norm.split()) > 8:
+        return False
+    return bool(_detect_sector(norm) or _detect_city(norm) or _detect_region(norm))
+
+
+def _merge_query_overrides(filters: AgentSearchFilters, norm: str) -> None:
+    sector = _detect_sector(norm)
+    if sector:
+        filters.sector = sector
+        filters.use_profile_sector = False
+    city = _detect_city(norm)
+    if city:
+        filters.location = city
+        filters.use_profile_city = False
+    region = _detect_region(norm)
+    if region:
+        filters.region = region
+    min_parsed, max_parsed = _parse_money_tl(norm)
+    if min_parsed is not None:
+        filters.min_cost = min_parsed
+    if max_parsed is not None:
+        filters.max_cost = max_parsed
+        filters.use_profile_budget = False
+
+
+def _apply_refine_to_filters(filters: AgentSearchFilters, norm: str, buyer: Buyer) -> None:
+    if re.search(r"daha ucuz|daha az|daha uygun", norm):
+        filters.sort = "cost_asc"
+        if filters.max_cost is not None:
+            filters.max_cost = filters.max_cost * 0.85
+        elif filters.use_profile_budget:
+            filters.max_cost = float(buyer.investment_budget) * 0.85
+    elif re.search(r"daha pahali|daha pahalı|daha cok|daha çok", norm):
+        filters.sort = "cost_desc"
+        if filters.max_cost is not None:
+            filters.min_cost = filters.max_cost * 0.9
+            filters.max_cost = None
+    if re.search(r"butceme|bütçeme|butcem|bütçem", norm):
+        filters.use_profile_budget = True
+        filters.max_cost = float(buyer.investment_budget)
+
+
+def parse_agent_query(
+    query: str,
+    buyer: Buyer,
+    *,
+    previous_search: Optional[dict] = None,
+) -> AgentNluResult:
     raw = query.strip()
     norm = _normalize(raw)
     intent = classify_intent(raw, None)
@@ -291,8 +424,16 @@ def parse_agent_query(query: str, buyer: Buyer) -> AgentNluResult:
     if any(h in norm for h in EXCLUDE_APPLIED_HINTS):
         filters.exclude_applied = True
 
-    if _is_gibberish(norm):
+    if _is_gibberish(norm) and intent not in GIBBERISH_EXEMPT_INTENTS:
         intent = "no_match"
+
+    if intent == "no_match" and _is_context_follow_up(norm, previous_search):
+        prev_filters = previous_search.get("filters_applied") if previous_search else None
+        if isinstance(prev_filters, dict) and prev_filters:
+            intent = "brand_search"
+            filters = _filters_from_applied(prev_filters)
+            _apply_refine_to_filters(filters, norm, buyer)
+            _merge_query_overrides(filters, norm)
 
     # Profil varsayılanları — yalnızca anlamlı brand_search sorgularında
     if intent == "brand_search":

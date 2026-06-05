@@ -146,6 +146,7 @@ def _search_brands_for_agent(
     if filters.exclude_applied:
         exclude = exclude | set(ctx.applied_brand_ids)
 
+    sort = BrandSort.cost_desc if filters.sort == "cost_desc" else BrandSort.cost_asc
     items, _total = list_approved_brands(
         db,
         sector=filters.sector,
@@ -156,7 +157,7 @@ def _search_brands_for_agent(
         q=filters.q,
         page=1,
         page_size=AGENT_CANDIDATE_POOL,
-        sort=BrandSort.cost_asc,
+        sort=sort,
     )
     items = [b for b in items if b.id not in exclude]
     roi_map = batch_estimated_roi_percent(db, items)
@@ -184,13 +185,26 @@ def _resolve_brands_by_names(db: Session, names: list[str]) -> list[Brand]:
     found: list[Brand] = []
     seen: set[int] = set()
     for name in names:
-        pattern = f"%{name.strip()}%"
+        cleaned = name.strip()
+        if not cleaned:
+            continue
+        pattern = f"%{cleaned}%"
         row = db.scalar(
             select(Brand).where(
                 Brand.is_approved.is_(True),
                 Brand.name.ilike(pattern),
             )
         )
+        if not row:
+            # "Komagene" → "Komagene Hub" gibi kısmi adlar için ilk kelime
+            first = cleaned.split()[0]
+            if len(first) >= 3:
+                row = db.scalar(
+                    select(Brand).where(
+                        Brand.is_approved.is_(True),
+                        Brand.name.ilike(f"%{first}%"),
+                    )
+                )
         if row and row.id not in seen:
             seen.add(row.id)
             found.append(row)
@@ -468,7 +482,11 @@ def answer_buyer_assistant(
             resp.latency_ms = int((time.perf_counter() - started) * 1000)
             return resp
 
-    nlu = parse_agent_query(payload.query, buyer)
+    nlu = parse_agent_query(
+        payload.query,
+        buyer,
+        previous_search=context.last_search_state,
+    )
     intent = nlu.intent
 
     if intent == "application_status":

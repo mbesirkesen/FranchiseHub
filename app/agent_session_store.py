@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -9,6 +10,30 @@ from sqlalchemy.orm import Session
 from .agent_config import AGENT_SESSION_MAX_MESSAGES
 from .models import AgentMessage, AgentMessageRole, AgentSession
 from .schemas import AgentMessageRead, AgentSessionRead
+
+
+def _json_dict(value: Any) -> Optional[dict]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _json_list(value: Any) -> Optional[list]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, list) else None
+    return None
 
 
 def create_session(
@@ -80,6 +105,30 @@ def append_message(
     return msg
 
 
+def last_brand_search_state(db: Session, session_id: int) -> Optional[dict]:
+    """Son marka arama turunun filtreleri ve marka id'leri — takip soruları için."""
+    row = db.scalar(
+        select(AgentMessage)
+        .where(
+            AgentMessage.session_id == session_id,
+            AgentMessage.role == AgentMessageRole.assistant.value,
+            AgentMessage.intent == "brand_search",
+        )
+        .order_by(AgentMessage.created_at.desc())
+        .limit(1)
+    )
+    if not row:
+        return None
+    filters_applied = _json_dict(row.filters_applied)
+    related_brand_ids = _json_list(row.related_brand_ids)
+    if not filters_applied:
+        return None
+    return {
+        "filters_applied": filters_applied,
+        "related_brand_ids": related_brand_ids or [],
+    }
+
+
 def recent_turns(db: Session, session_id: int, limit: int) -> list[tuple[str, str]]:
     rows = db.scalars(
         select(AgentMessage)
@@ -146,8 +195,8 @@ def session_messages(db: Session, session_id: int, buyer_id: int) -> list[AgentM
             content=m.content,
             intent=m.intent,
             source=m.source,
-            filters_applied=m.filters_applied if isinstance(m.filters_applied, dict) else None,
-            related_brand_ids=m.related_brand_ids if isinstance(m.related_brand_ids, list) else None,
+            filters_applied=_json_dict(m.filters_applied),
+            related_brand_ids=_json_list(m.related_brand_ids),
             created_at=m.created_at,
         )
         for m in rows

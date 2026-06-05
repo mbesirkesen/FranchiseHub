@@ -59,6 +59,7 @@ def maybe_enhance_answer(
             headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json",
+                "User-Agent": "FranchiseHub-Agent/1.0",
             },
             method="POST",
         )
@@ -72,6 +73,13 @@ def maybe_enhance_answer(
         )
         if text and len(text) <= 2000:
             return text, "hybrid"
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:300]
+        except OSError:
+            pass
+        _log.warning("LLM enhance HTTP %s: %s", exc.code, body or exc.reason)
     except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
         _log.warning("LLM enhance failed: %s", exc)
     return draft_answer, "rules"
