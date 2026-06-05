@@ -183,6 +183,78 @@ def _search_brands_for_agent(
     return assistant_brands, ids
 
 
+def _pick_from_previous_brands(
+    db: Session,
+    buyer: Buyer,
+    *,
+    brand_ids: list[int],
+    pick_mode: str,
+) -> AssistantQueryResponse:
+    rows = list(
+        db.scalars(
+            select(Brand).where(Brand.id.in_(brand_ids), Brand.is_approved.is_(True))
+        ).all()
+    )
+    if not rows:
+        return AssistantQueryResponse(
+            answer="Önceki listede marka bulamadım. Yeni bir arama yapabilirsiniz.",
+            intent="brand_pick",
+            suggestions=_refine_suggestions(),
+            source="rules",
+        )
+
+    roi_map = batch_estimated_roi_percent(db, rows)
+    scored: list[tuple[Brand, int, list[str], float]] = []
+    for brand in rows:
+        match_score, reasons = score_brand_match(
+            brand,
+            investment_budget=buyer.investment_budget,
+            preferred_sector=buyer.preferred_sector,
+            experience_years=buyer.experience_years,
+            city=buyer.city,
+        )
+        roi = roi_map.get(brand.id, 12.0)
+        scored.append((brand, match_score, reasons, float(brand.initial_cost)))
+
+    if pick_mode == "cheapest":
+        scored.sort(key=lambda x: x[3])
+        label = "En ucuz"
+    elif pick_mode == "expensive":
+        scored.sort(key=lambda x: -x[3])
+        label = "En yüksek yatırım gerektiren"
+    else:
+        scored.sort(key=lambda x: (-x[1], x[3]))
+        label = "Profilinize en uygun"
+
+    chosen, match_score, reasons, cost = scored[0]
+    assistant = _to_assistant_brand(
+        chosen,
+        match_score=match_score,
+        match_reasons=reasons,
+        estimated_roi_percent=roi_map.get(chosen.id, 12.0),
+    )
+    others = [
+        f"{b.name} ({float(b.initial_cost):,.0f} TL)"
+        for b, _, _, _ in scored[1:4]
+    ]
+    answer = (
+        f"{label} seçenek: {chosen.name} — yatırım {float(chosen.initial_cost):,.0f} TL, "
+        f"tahmini ROI %{roi_map.get(chosen.id, 12.0):.1f}."
+    )
+    if others:
+        answer += " Diğerleri: " + ", ".join(others) + "."
+
+    return AssistantQueryResponse(
+        answer=answer,
+        intent="brand_pick",
+        related_brands=[assistant],
+        related_brand_ids=[chosen.id],
+        filters_applied={"pick_mode": pick_mode, "from_brand_ids": brand_ids},
+        suggestions=_default_suggestions([assistant]),
+        source="rules",
+    )
+
+
 def _resolve_brands_by_names(db: Session, names: list[str]) -> list[Brand]:
     found: list[Brand] = []
     seen: set[int] = set()
@@ -504,6 +576,15 @@ def answer_buyer_assistant(
     if intent == "favorites_similar":
         resp = _favorites_similar_answer(db, buyer, context)
         resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=nlu.filters)
+        resp.latency_ms = int((time.perf_counter() - started) * 1000)
+        return resp
+
+    if intent == "brand_pick" and nlu.pick_mode and context.last_search_state:
+        prev_ids = context.last_search_state.get("related_brand_ids") or []
+        resp = _pick_from_previous_brands(
+            db, buyer, brand_ids=prev_ids, pick_mode=nlu.pick_mode
+        )
+        resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
         resp.latency_ms = int((time.perf_counter() - started) * 1000)
         return resp
 

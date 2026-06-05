@@ -106,27 +106,27 @@ def append_message(
 
 
 def last_brand_search_state(db: Session, session_id: int) -> Optional[dict]:
-    """Son marka arama turunun filtreleri ve marka id'leri — takip soruları için."""
-    row = db.scalar(
+    """Son marka listesi dönen tur — takip soruları (en ucuz hangisi vb.) için."""
+    rows = db.scalars(
         select(AgentMessage)
         .where(
             AgentMessage.session_id == session_id,
             AgentMessage.role == AgentMessageRole.assistant.value,
-            AgentMessage.intent == "brand_search",
         )
         .order_by(AgentMessage.created_at.desc())
-        .limit(1)
-    )
-    if not row:
-        return None
-    filters_applied = _json_dict(row.filters_applied)
-    related_brand_ids = _json_list(row.related_brand_ids)
-    if not filters_applied:
-        return None
-    return {
-        "filters_applied": filters_applied,
-        "related_brand_ids": related_brand_ids or [],
-    }
+        .limit(8)
+    ).all()
+    for row in rows:
+        related_brand_ids = _json_list(row.related_brand_ids) or []
+        if not related_brand_ids:
+            continue
+        filters_applied = _json_dict(row.filters_applied) or {}
+        return {
+            "filters_applied": filters_applied,
+            "related_brand_ids": related_brand_ids,
+            "intent": row.intent,
+        }
+    return None
 
 
 def recent_turns(db: Session, session_id: int, limit: int) -> list[tuple[str, str]]:

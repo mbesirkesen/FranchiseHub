@@ -99,6 +99,15 @@ REFINE_HINTS = (
     "yerine",
     "baska sektor",
     "başka sektör",
+    "en ucuz",
+    "en ucuzu",
+    "en pahali",
+    "en pahalı",
+    "en ucuza",
+    "hangisi",
+    "hangisini",
+    "en iyi",
+    "en uygun",
 )
 
 
@@ -124,6 +133,7 @@ class AgentNluResult:
     filters: AgentSearchFilters = field(default_factory=AgentSearchFilters)
     free_text_tokens: list[str] = field(default_factory=list)
     compare_brand_names: list[str] = field(default_factory=list)
+    pick_mode: Optional[str] = None  # cheapest | expensive | best_match
 
 
 def _normalize(text: str) -> str:
@@ -338,8 +348,27 @@ def _filters_from_applied(data: Optional[dict]) -> AgentSearchFilters:
     return f
 
 
+def _detect_pick_mode(norm: str) -> Optional[str]:
+    """Önceki listeden seçim: en ucuz hangisi, en iyisi vb."""
+    if re.search(r"en ucuz|en ucuzu|en ucuza|en dusuk|en düşük", norm):
+        return "cheapest"
+    if re.search(r"hangisi", norm) and re.search(r"ucuz", norm):
+        return "cheapest"
+    if re.search(r"en pahali|en pahalı|en yuksek|en yüksek", norm):
+        return "expensive"
+    if re.search(r"hangisi", norm) and re.search(r"pahali|pahalı", norm):
+        return "expensive"
+    if re.search(r"en iyi|en uygun|hangisi iyi|hangisi daha iyi", norm):
+        return "best_match"
+    if norm.strip() in ("hangisi", "hangisini", "en iyisi", "en ucuzu"):
+        return "cheapest" if "ucuz" in norm else "best_match"
+    if re.search(r"^hangisi\b", norm):
+        return "cheapest"
+    return None
+
+
 def _is_refine_follow_up(norm: str) -> bool:
-    return any(h in norm for h in REFINE_HINTS)
+    return any(h in norm for h in REFINE_HINTS) or _detect_pick_mode(norm) is not None
 
 
 def _is_context_follow_up(norm: str, previous_search: Optional[dict]) -> bool:
@@ -479,6 +508,15 @@ def parse_agent_query(
     if _is_gibberish(norm) and intent not in GIBBERISH_EXEMPT_INTENTS:
         intent = "no_match"
 
+    pick_mode = _detect_pick_mode(norm)
+    if pick_mode and previous_search:
+        prev_ids = previous_search.get("related_brand_ids") or []
+        if prev_ids:
+            intent = "brand_pick"
+            prev_filters = previous_search.get("filters_applied")
+            if isinstance(prev_filters, dict):
+                filters = _filters_from_applied(prev_filters)
+
     if intent == "no_match" and _is_context_follow_up(norm, previous_search):
         prev_filters = previous_search.get("filters_applied") if previous_search else None
         if isinstance(prev_filters, dict) and prev_filters:
@@ -529,6 +567,7 @@ def parse_agent_query(
         filters=filters,
         free_text_tokens=free,
         compare_brand_names=compare_names,
+        pick_mode=pick_mode if intent == "brand_pick" else None,
     )
 
 
