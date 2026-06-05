@@ -51,9 +51,17 @@ def create_message(
     require_application_access(db, application, current_user)
 
     if application.status != ApplicationStatus.approved:
+        status_tr = {
+            ApplicationStatus.pending: "beklemede",
+            ApplicationStatus.rejected: "reddedildi",
+            ApplicationStatus.approved: "onaylandı",
+        }.get(application.status, str(application.status))
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Messaging is only available for approved applications",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Mesajlaşma yalnızca onaylanmış (approved) başvurularda açıktır. "
+                f"Bu başvurunun durumu: {status_tr} ({application.status.value})."
+            ),
         )
 
     message = Message(
@@ -92,6 +100,32 @@ def list_messages(
     return list_messages_for_user(db, application_id, current_user)
 
 
+def _mark_all_messages_read_handler(
+    application_id: int,
+    db: Session,
+    current_user: AuthenticatedPrincipal,
+) -> MessagesReadAllResponse:
+    application = get_application_or_404(db, application_id)
+    require_application_access(db, application, current_user)
+    count = mark_all_messages_read_for_application(db, application_id, current_user)
+    return MessagesReadAllResponse(
+        application_id=application_id, updated_count=count
+    )
+
+
+@router.patch(
+    "/messages/{application_id}/read-all",
+    response_model=MessagesReadAllResponse,
+)
+def mark_all_messages_read_patch(
+    application_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    """Frontend sözleşmesi: PATCH /messages/{application_id}/read-all"""
+    return _mark_all_messages_read_handler(application_id, db, current_user)
+
+
 @router.post(
     "/messages/{application_id}/read-all",
     response_model=MessagesReadAllResponse,
@@ -101,10 +135,8 @@ def mark_all_messages_read(
     db: Session = Depends(get_db),
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
-    count = mark_all_messages_read_for_application(db, application_id, current_user)
-    return MessagesReadAllResponse(
-        application_id=application_id, updated_count=count
-    )
+    """Geriye dönük uyumluluk: POST alias."""
+    return _mark_all_messages_read_handler(application_id, db, current_user)
 
 
 @router.patch("/messages/{message_id}/read", response_model=MessageReadUpdateResponse)

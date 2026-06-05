@@ -33,7 +33,7 @@ def notify_new_application(
         recipient_id=brand.franchise_owner_id,
         title="Yeni başvuru",
         body=f"{_buyer_display(buyer)}, «{brand.name}» markanıza başvurdu.",
-        notification_type="application",
+        notification_type="application_pending",
         action_url=f"/franchise-owner/applications/{application.id}",
         resource_type="application",
         resource_id=application.id,
@@ -51,9 +51,11 @@ def notify_application_status_change(
     if new_status == ApplicationStatus.approved:
         title = "Başvurunuz onaylandı"
         body = f"«{brand.name}» başvurunuz onaylandı. Mesajlaşmaya başlayabilirsiniz."
+        ntype = "application_approved"
     elif new_status == ApplicationStatus.rejected:
         title = "Başvurunuz reddedildi"
         body = f"«{brand.name}» başvurunuz reddedildi."
+        ntype = "application_rejected"
     else:
         return
 
@@ -63,7 +65,7 @@ def notify_application_status_change(
         recipient_id=buyer.id,
         title=title,
         body=body,
-        notification_type="application",
+        notification_type=ntype,
         action_url=f"/buyer/applications/{application.id}",
         resource_type="application",
         resource_id=application.id,
