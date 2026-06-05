@@ -37,10 +37,15 @@ CITY_KEYWORDS: dict[str, str] = {
     "antalya": "Antalya",
 }
 
-COMPARE_HINTS = ("karşılaştır", "karsilastir", "compare", " ile ", " vs ", " ve ")
+COMPARE_HINTS = ("karşılaştır", "karsilastir", "compare")
 DETAIL_HINTS = ("roi", "getiri", "trend", "şube", "sube", "metrik", "kaç şube", "büyüme")
-APPLICATION_HINTS = ("başvuru", "basvuru", "application", "başvurum", "basvurum", "durumda")
+APPLICATION_HINTS = ("başvuru", "basvuru", "application", "başvurum", "basvurum", "durumda", "başvurularım", "basvurularim")
 GENERAL_HINTS = ("franchise nedir", "bayilik nedir", "nasıl çalışır", "nasil calisir")
+GREETING_HINTS = ("merhaba", "selam", "naber", "gunaydin", "günaydın", "iyi gunler", "iyi günler", "nasilsin", "nasılsın")
+HELP_HINTS = ("yardim", "yardım", "nasil kullanilir", "nasıl kullanılır", "ne yapabilirsin")
+RECOMMEND_HINTS = ("onerir", "önerir", "tavsiye", "ne onerirsin", "ne önerirsin", "bana uygun", "uygun marka", "öneri", "oneri")
+PRODUCT_KEYWORDS = ("pizza", "doner", "döner", "burger", "waffle", "tatli", "tatlı", "cicek", "çiçek", "komagene", "starbucks", "brew")
+BRAND_INFO_HINTS = ("hakkinda", "hakkında", "detay", "bilgi ver", "nedir bu")
 FAVORITES_HINTS = ("favori", "favorilerim", "favorilerime", "favorilerimde")
 EXCLUDE_APPLIED_HINTS = (
     "basvurdugum haric",
@@ -201,8 +206,23 @@ def _detect_city(norm: str) -> Optional[str]:
     return None
 
 
+def _is_compare_intent(norm: str, raw: str) -> bool:
+    if any(h in norm for h in COMPARE_HINTS) or " vs " in norm:
+        return True
+    # «Komagene ile Brew Max» — yalnızca karşılaştırma fiili veya iki marka adı
+    if re.search(r"\s+ile\s+", norm) and not re.search(
+        r"ne yapabilirim|ne yapabilir|nasil|nasıl|yapmak|istiyorum", norm
+    ):
+        names = extract_compare_brand_names(raw)
+        if len(names) >= 2:
+            return True
+    return False
+
+
 def _is_gibberish(norm: str) -> bool:
     if any(h in norm for h in APPLICATION_HINTS + COMPARE_HINTS + FAVORITES_HINTS + GENERAL_HINTS):
+        return False
+    if any(h in norm for h in GREETING_HINTS + HELP_HINTS + RECOMMEND_HINTS + PRODUCT_KEYWORDS):
         return False
     if any(h in norm for h in REFINE_HINTS):
         return False
@@ -256,10 +276,18 @@ def classify_intent(query: str, brand_id: Optional[int]) -> str:
         w in norm for w in ("benzer", "oner", "öner", "gibi", "similar")
     ):
         return "favorites_similar"
-    if any(h in norm for h in COMPARE_HINTS):
+    if _is_compare_intent(norm, query):
         return "brand_compare"
     if any(h in norm for h in GENERAL_HINTS):
         return "general"
+    if any(norm == g or norm.startswith(g + " ") for g in GREETING_HINTS + HELP_HINTS):
+        return "general"
+    if any(h in norm for h in RECOMMEND_HINTS):
+        return "brand_search"
+    if any(p in norm for p in PRODUCT_KEYWORDS):
+        return "brand_search"
+    if any(h in norm for h in BRAND_INFO_HINTS):
+        return "brand_search"
     if _is_gibberish(norm):
         return "no_match"
     has_money = bool(
@@ -345,6 +373,38 @@ def _merge_query_overrides(filters: AgentSearchFilters, norm: str) -> None:
         filters.use_profile_budget = False
 
 
+def _apply_conversational_filters(filters: AgentSearchFilters, norm: str, buyer: Buyer) -> None:
+    if re.search(r"\bucuz\b", norm):
+        filters.sort = "cost_asc"
+        if filters.q in ("ucuz", "ucuzlar", "ucuza"):
+            filters.q = None
+    elif re.search(r"\bpahali|pahalı|premium|luks|lüks\b", norm):
+        filters.sort = "cost_desc"
+    if re.search(r"\biyi\b|en iyi|roi|getiri", norm):
+        filters.sort = "cost_desc"
+    if re.search(
+        r"butceme|bütçeme|butcem|bütçem|butceme gore|bütçeme göre|oner|öner|tavsiye|bana uygun|uygun marka",
+        norm,
+    ):
+        filters.use_profile_budget = True
+        filters.max_cost = float(buyer.investment_budget)
+    for product in PRODUCT_KEYWORDS:
+        if product in norm and not filters.q:
+            filters.q = product
+            break
+    if filters.location and filters.q and filters.q in CITY_KEYWORDS:
+        filters.q = None
+
+
+def extract_brand_name_tokens(norm: str) -> list[str]:
+    stop = {
+        "hakkinda", "hakkında", "bilgi", "detay", "nedir", "marka", "franchise",
+        "bayilik", "icin", "için", "ver", "lutfen", "lütfen",
+    }
+    tokens = [t for t in re.split(r"\s+", norm) if len(t) >= 3 and t not in stop]
+    return [" ".join(w.capitalize() for w in t.split()) for t in tokens[:4]]
+
+
 def _apply_refine_to_filters(filters: AgentSearchFilters, norm: str, buyer: Buyer) -> None:
     if re.search(r"daha ucuz|daha az|daha uygun", norm):
         filters.sort = "cost_asc"
@@ -388,34 +448,26 @@ def parse_agent_query(
     # Serbest metin: sektör/bölge dışı kısa anahtar kelimeler
     tokens = [t for t in re.split(r"\s+", norm) if len(t) >= 3]
     stop = {
-        "marka",
-        "markalari",
-        "franchise",
-        "bayilik",
-        "bayilikleri",
-        "icin",
-        "alti",
-        "altı",
-        "uygun",
-        "firsat",
-        "fırsat",
-        "lari",
-        "ler",
-        "bin",
-        "milyon",
-        "tl",
-        "alti",
-        "kadar",
-        "butceme",
-        "butcem",
-        "butce",
+        "marka", "markalari", "markalar", "franchise", "bayilik", "bayilikleri",
+        "icin", "için", "alti", "altı", "uygun", "firsat", "fırsat", "lari", "ler",
+        "bin", "milyon", "tl", "kadar", "butceme", "butcem", "butce", "bana", "sana",
+        "onerir", "önerir", "onerirsin", "önerirsin", "oner", "öner", "misin", "mısın",
+        "iyi", "hangi", "en",
+        "var", "mi", "mı", "ne", "nasil", "nasıl", "istiyorum", "kurmak", "is", "iş",
+        "yapabilirim", "yapabilir", "ile", "ve", "olsun", "goster", "göster", "peki", "ya", "bir", "the",
+        "hakkinda", "hakkında", "bilgi", "detay", "yardim", "yardım", "et", "selam",
+        "merhaba", "tavsiye", "oneri", "öneri", "gore", "göre",
     }
     free = [t for t in tokens if t not in stop and not t.isdigit()]
     if free and not filters.q:
-        # "fast" gibi kısa terimler
-        short = [t for t in free if len(t) <= 8 and t not in ("gida", "gıda", "marmara")]
+        short = [
+            t for t in free
+            if 3 <= len(t) <= 12 and t not in ("gida", "gıda", "marmara", "istanbulda", "ankarada")
+        ]
         if short:
-            filters.q = short[0] if len(short[0]) >= 3 else None
+            filters.q = short[0]
+    if filters.location and filters.q:
+        filters.q = None
 
     compare_names: list[str] = []
     if intent == "brand_compare":
@@ -437,19 +489,40 @@ def parse_agent_query(
 
     # Profil varsayılanları — yalnızca anlamlı brand_search sorgularında
     if intent == "brand_search":
+        _apply_conversational_filters(filters, norm, buyer)
         if filters.max_cost is None and filters.use_profile_budget:
             filters.max_cost = float(buyer.investment_budget)
         if filters.sector is None and (
             filters.use_profile_budget
-            or re.search(r"butceme|bütçeme|öner|oner|uygun bayilik|uygun marka", norm)
+            or re.search(
+                r"butceme|bütçeme|öner|oner|uygun|tavsiye|bana uygun|ne onerirsin|ne önerirsin",
+                norm,
+            )
         ):
             if buyer.preferred_sector:
                 filters.use_profile_sector = True
                 filters.sector = buyer.preferred_sector
         if filters.location is None and filters.region is None and buyer.city:
-            if re.search(r"yakın|yakin|yakınımda|sehrim|şehrim", norm):
+            if re.search(r"yakın|yakin|yakınımda|sehrim|şehrim|is kurmak|iş kurmak", norm):
                 filters.use_profile_city = True
                 filters.location = buyer.city
+        if (
+            filters.sector is None
+            and filters.max_cost is None
+            and not filters.q
+            and any(h in norm for h in RECOMMEND_HINTS)
+        ):
+            filters.use_profile_budget = True
+            filters.max_cost = float(buyer.investment_budget)
+            if buyer.preferred_sector:
+                filters.use_profile_sector = True
+                filters.sector = buyer.preferred_sector
+        if filters.max_cost is not None and re.search(r"ne yapabilirim|ne yapabilir", norm):
+            if filters.q in ("ile", "ve", "ne"):
+                filters.q = None
+            if buyer.preferred_sector and filters.sector is None:
+                filters.sector = buyer.preferred_sector
+                filters.use_profile_sector = True
 
     return AgentNluResult(
         intent=intent,

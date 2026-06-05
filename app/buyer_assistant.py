@@ -11,7 +11,9 @@ from .agent_context import AgentBuyerContext, favorite_brands
 from .agent_llm import maybe_enhance_answer
 from .agent_nlu import (
     AgentSearchFilters,
+    _normalize,
     classify_intent,
+    extract_brand_name_tokens,
     filters_applied_dict,
     filters_human_label,
     parse_agent_query,
@@ -506,12 +508,20 @@ def answer_buyer_assistant(
         return resp
 
     if intent == "general":
-        return AssistantQueryResponse(
-            answer=(
+        norm = _normalize(payload.query)
+        if any(norm.startswith(g) or norm == g for g in ("merhaba", "selam", "naber", "nasilsin", "nasılsın")):
+            answer = (
+                "Merhaba! FranchiseHub asistanıyım — bütçe, sektör veya şehir söyleyerek "
+                "marka önerebilirim. Örnek: «500 bin TL altı gıda» veya «bana uygun marka öner»."
+            )
+        else:
+            answer = (
                 "FranchiseHub'da onaylı markaları keşfedebilir, bütçe ve sektörünüze göre "
                 "filtreleyebilir ve başvuru oluşturabilirsiniz. "
                 "Örnek: «500 bin TL altı gıda markaları» veya «İstanbul'da kahve franchise»."
-            ),
+            )
+        return AssistantQueryResponse(
+            answer=answer,
             intent="general",
             suggestions=_refine_suggestions(),
             source="rules",
@@ -519,6 +529,40 @@ def answer_buyer_assistant(
         )
 
     if intent == "no_match":
+        norm = _normalize(payload.query)
+        if any(h in norm for h in ("hakkinda", "hakkında", "detay", "bilgi")):
+            for name in extract_brand_name_tokens(norm):
+                resolved = _resolve_brands_by_names(db, [name])
+                if len(resolved) == 1:
+                    resp = _brand_detail_answer(db, buyer, resolved[0].id)
+                    resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer)
+                    resp.latency_ms = int((time.perf_counter() - started) * 1000)
+                    return resp
+        if any(h in norm for h in ("oner", "öner", "tavsiye", "uygun")):
+            nlu = parse_agent_query(payload.query, buyer, previous_search=context.last_search_state)
+            nlu.intent = "brand_search"
+            nlu.filters.use_profile_budget = True
+            nlu.filters.max_cost = float(buyer.investment_budget)
+            if buyer.preferred_sector and not nlu.filters.sector:
+                nlu.filters.sector = buyer.preferred_sector
+                nlu.filters.use_profile_sector = True
+            brands, brand_ids = _search_brands_for_agent(db, buyer, nlu.filters, context)
+            if brands:
+                resp = AssistantQueryResponse(
+                    answer=_build_brand_search_answer(
+                        filters=nlu.filters, buyer=buyer, count=len(brands)
+                    ),
+                    intent="brand_search",
+                    suggestions=_default_suggestions(brands),
+                    related_brands=brands,
+                    related_brand_ids=brand_ids,
+                    filters_applied=filters_applied_dict(nlu.filters),
+                    source="rules",
+                )
+                resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=nlu.filters)
+                resp.latency_ms = int((time.perf_counter() - started) * 1000)
+                return resp
+
         return AssistantQueryResponse(
             answer=(
                 "Sorunuzu tam anlayamadım. Bütçe (ör. 500 bin TL), sektör (gıda, kahve), "
