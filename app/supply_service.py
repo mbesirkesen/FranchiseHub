@@ -62,6 +62,31 @@ def find_inventory_by_product(
     return None
 
 
+def validate_buyer_supply_quantity(
+    db: Session,
+    *,
+    franchise_owner_id: int,
+    product_name: str,
+    quantity: int,
+) -> None:
+    """Talep adedi merkez deposundaki stoktan fazla olamaz."""
+    normalized = normalize_product_name(product_name)
+    center = find_inventory_by_product(
+        db, franchise_owner_id, normalized, outlet_id=None
+    )
+    if center is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Merkez deposunda “{normalized}” bulunamadı. Listeden ürün seçin.",
+        )
+    available = int(center.stock_level or 0)
+    if quantity > available:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Merkezde en fazla {available} adet talep edilebilir.",
+        )
+
+
 def apply_supply_to_inventory(db: Session, request: SupplyRequest) -> None:
     """Sevkiyat: merkez deposundan düş, ilgili şube stoğuna ekle."""
     outlet_id = request.outlet_id

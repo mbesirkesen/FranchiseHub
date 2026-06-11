@@ -23,6 +23,7 @@ from ..models import (
 )
 from ..pagination import paginated_meta
 from ..product_utils import normalize_product_name
+from ..supply_service import validate_buyer_supply_quantity
 from ..schemas import (
     AssistantQueryRequest,
     AssistantQueryResponse,
@@ -423,11 +424,18 @@ def create_buyer_supply_request(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Outlet not found for this brand",
         )
+    product_name = normalize_product_name(payload.product_name)
+    validate_buyer_supply_quantity(
+        db,
+        franchise_owner_id=brand.franchise_owner_id,
+        product_name=product_name,
+        quantity=payload.quantity,
+    )
     row = SupplyRequest(
         franchise_owner_id=brand.franchise_owner_id,
         buyer_id=current_user.user_id,
         outlet_id=payload.outlet_id,
-        product_name=normalize_product_name(payload.product_name),
+        product_name=product_name,
         quantity=payload.quantity,
         status=SupplyRequestStatus.pending,
     )
