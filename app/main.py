@@ -17,6 +17,7 @@ from .routers import (
     messages,
     notifications,
     protected,
+    reference,
     search,
 )
 
@@ -40,6 +41,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(agent.router)
 app.include_router(brands.router)
+app.include_router(reference.router)
 app.include_router(files.router)
 app.include_router(franchise_owner.router)
 app.include_router(franchise_owner_ops.router)
