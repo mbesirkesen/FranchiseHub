@@ -15,8 +15,11 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
+from pgvector.sqlalchemy import Vector
 
 from .database import Base
+
+BRAND_EMBEDDING_DIM = 384
 
 
 class UserRole(str, enum.Enum):
@@ -148,6 +151,8 @@ class Brand(Base):
     sector = Column(String(255), nullable=True, index=True)
     description = Column(Text, nullable=True)
     initial_cost = Column(Float, nullable=False)
+    min_investment_cost = Column(Float, nullable=True)
+    max_investment_cost = Column(Float, nullable=True)
     support_details = Column(Text, nullable=True)
     location = Column(String(255), nullable=True)
     is_approved = Column(Boolean, nullable=False, default=False)
@@ -161,6 +166,25 @@ class Brand(Base):
     territories = relationship(
         "BrandTerritory", back_populates="brand", cascade="all, delete-orphan"
     )
+    embedding_row = relationship(
+        "BrandEmbedding",
+        back_populates="brand",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class BrandEmbedding(Base):
+    __tablename__ = "brand_embeddings"
+
+    brand_id = Column(
+        Integer, ForeignKey("brands.id", ondelete="CASCADE"), primary_key=True
+    )
+    embedding = Column(Vector(BRAND_EMBEDDING_DIM), nullable=False)
+    content_hash = Column(String(64), nullable=False)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    brand = relationship("Brand", back_populates="embedding_row")
 
 
 class BrandMedia(Base):
@@ -429,13 +453,17 @@ class AgentSession(Base):
     __tablename__ = "agent_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
-    buyer_id = Column(Integer, ForeignKey("buyers.id"), nullable=False, index=True)
+    buyer_id = Column(Integer, ForeignKey("buyers.id"), nullable=True, index=True)
+    franchise_owner_id = Column(
+        Integer, ForeignKey("franchise_owners.id"), nullable=True, index=True
+    )
     title = Column(String(200), nullable=True)
     brand_context_id = Column(Integer, ForeignKey("brands.id"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     buyer = relationship("Buyer", back_populates="agent_sessions")
+    franchise_owner = relationship("FranchiseOwner")
     messages = relationship(
         "AgentMessage", back_populates="session", cascade="all, delete-orphan", order_by="AgentMessage.created_at"
     )
