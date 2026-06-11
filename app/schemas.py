@@ -11,6 +11,25 @@ from pydantic import (
     computed_field,
 )
 
+from app.demo_text import strip_demo_markers
+
+
+def _strip_demo_optional(v: object) -> object:
+    if v is None or not isinstance(v, str):
+        return v
+    return strip_demo_markers(v)
+
+
+def _strip_demo_required(v: object) -> object:
+    if not isinstance(v, str):
+        return v
+    cleaned = strip_demo_markers(v)
+    return cleaned if cleaned else v.strip()
+
+
+DemoCleanOptionalStr = Annotated[Optional[str], BeforeValidator(_strip_demo_optional)]
+DemoCleanStr = Annotated[str, BeforeValidator(_strip_demo_required)]
+
 
 def _normalize_email(v: object) -> str:
     if not isinstance(v, str):
@@ -168,9 +187,9 @@ class AuthMeResponse(BaseModel):
 class BrandBase(BaseModel):
     name: str
     sector: Optional[str] = None
-    description: Optional[str] = None
+    description: DemoCleanOptionalStr = None
     initial_cost: float
-    support_details: Optional[str] = None
+    support_details: DemoCleanOptionalStr = None
     location: Optional[str] = None
 
 
@@ -346,7 +365,7 @@ class ApplicationBase(BaseModel):
     buyer_id: int
     brand_id: int
     status: ApplicationStatus = ApplicationStatus.pending
-    notes: Optional[str] = None
+    notes: DemoCleanOptionalStr = None
 
 
 class ApplicationCreate(ApplicationBase):
@@ -362,6 +381,19 @@ class ApplicationRead(ApplicationBase):
 
 class ApplicationListEnvelope(BaseModel):
     items: list[ApplicationRead]
+    total: int
+    page: int = 1
+    page_size: int = 20
+    total_pages: int = 0
+
+
+class OwnerApplicationListItem(ApplicationRead):
+    buyer_name: str = ""
+    brand_name: str = ""
+
+
+class OwnerApplicationListEnvelope(BaseModel):
+    items: list[OwnerApplicationListItem]
     total: int
     page: int = 1
     page_size: int = 20
@@ -412,7 +444,7 @@ class BrandCompareItem(BaseModel):
     sector: Optional[str] = None
     location: Optional[str] = None
     initial_cost: float
-    support_details: Optional[str] = None
+    support_details: DemoCleanOptionalStr = None
     is_approved: bool = False
 
     @computed_field
@@ -437,13 +469,14 @@ class BrandFinancialSummary(BaseModel):
     max_investment_cost: float
     sector: Optional[str] = None
     location: Optional[str] = None
-    support_details: Optional[str] = None
+    support_details: DemoCleanOptionalStr = None
 
 
 class BrandCompareResponse(BaseModel):
     brands: list[BrandCompareItem]
     comparison_table: BrandCompareTable
     financial_summaries: list[BrandFinancialSummary] = Field(default_factory=list)
+    insights: Optional[str] = None
 
 
 class BrandMediaRead(BaseModel):
@@ -495,10 +528,10 @@ class BrandTerritoryRead(BaseModel):
 
     id: int
     brand_id: int
-    name: str
+    name: DemoCleanStr
     region_code: Optional[str] = None
     status: str
-    notes: Optional[str] = None
+    notes: DemoCleanOptionalStr = None
 
 
 class BrandTerritoryListResponse(BaseModel):
@@ -533,6 +566,20 @@ class RegionOption(BaseModel):
 
 class RegionListResponse(BaseModel):
     items: list[RegionOption]
+
+
+class ReferenceListResponse(BaseModel):
+    items: list[str]
+
+
+class SectorListResponse(BaseModel):
+    items: list[str]
+
+
+class PlatformStatsResponse(BaseModel):
+    approved_brands: int = 0
+    total_applications: int = 0
+    sectors: list[str] = Field(default_factory=list)
 
 
 class MessagesReadAllResponse(BaseModel):
@@ -578,7 +625,7 @@ class FranchiseOutletRead(BaseModel):
     id: int
     franchise_owner_id: int
     brand_id: Optional[int] = None
-    name: str
+    name: DemoCleanStr
     city: str
     address: Optional[str] = None
     status: OutletStatus
@@ -882,7 +929,7 @@ class ApplicationsMineResponse(BaseModel):
 
 class SupplyRequestBase(BaseModel):
     franchise_owner_id: int
-    product_name: str
+    product_name: DemoCleanStr
     quantity: int
     status: SupplyRequestStatus = SupplyRequestStatus.pending
 
@@ -961,7 +1008,7 @@ class InventoryRead(BaseModel):
     id: int
     franchise_owner_id: int
     outlet_id: Optional[int] = None
-    item_name: str
+    item_name: DemoCleanStr
     stock_level: int
     low_stock_threshold: int = 10
 

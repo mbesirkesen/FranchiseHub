@@ -97,7 +97,7 @@ def _get_or_create_owner(db, spec: dict) -> tuple[FranchiseOwner, Brand]:
             authorized_person_name=spec["person"],
             country="Türkiye",
             city=spec["city"],
-            company_address=f"{spec['city']} merkez ofis — {DEMO}",
+            company_address=f"{spec['city']} merkez ofis",
             website=f"https://demo-{abs(hash(spec['email'])) % 99999}.local",
             verification_status=True,
             email_verified=True,
@@ -119,7 +119,7 @@ def _get_or_create_owner(db, spec: dict) -> tuple[FranchiseOwner, Brand]:
             sector=bspec["sector"],
             description=bspec["desc"],
             initial_cost=bspec["cost"],
-            support_details=f"{DEMO} Açılış eğitimi, operasyon el kitabı, dijital pazarlama.",
+            support_details="Açılış eğitimi, operasyon el kitabı, dijital pazarlama.",
             location=bspec["location"],
             is_approved=True,
         )
@@ -132,9 +132,9 @@ def _seed_brand_extras(
     db, owner: FranchiseOwner, brand: Brand, *, full: bool = True
 ) -> None:
     for tname, code, st in [
-        (f"{DEMO} Merkez", f"TR-{brand.id}-01", TerritoryStatus.available),
-        (f"{DEMO} Bölge 2", f"TR-{brand.id}-02", TerritoryStatus.available),
-        (f"{DEMO} Rezerve", f"TR-{brand.id}-03", TerritoryStatus.reserved),
+        ("Merkez", f"TR-{brand.id}-01", TerritoryStatus.available),
+        ("Bölge 2", f"TR-{brand.id}-02", TerritoryStatus.available),
+        ("Rezerve", f"TR-{brand.id}-03", TerritoryStatus.reserved),
     ]:
         if db.scalar(
             select(BrandTerritory.id).where(
@@ -160,7 +160,7 @@ def _seed_brand_extras(
             FranchiseOutlet(
                 franchise_owner_id=owner.id,
                 brand_id=brand.id,
-                name=f"{DEMO} {brand.name[:40]} — Merkez",
+                name=f"{brand.name[:40]} — Merkez",
                 city=owner.city,
                 address=f"{owner.city} merkez şube",
                 status=OutletStatus.active,
@@ -190,13 +190,13 @@ def _seed_brand_extras(
     if db.scalar(
         select(BrandFDDDocument.id).where(
             BrandFDDDocument.brand_id == brand.id,
-            BrandFDDDocument.title == f"{DEMO} FDD",
+            BrandFDDDocument.title == "Franchise Bilgi Formu",
         )
     ) is None:
         db.add(
             BrandFDDDocument(
                 brand_id=brand.id,
-                title=f"{DEMO} FDD",
+                title="Franchise Bilgi Formu",
                 version="2026.1",
                 file_path=_write_placeholder(f"seed/brands/{brand.id}/fdd.pdf"),
                 mime_type="application/pdf",
@@ -208,13 +208,13 @@ def _seed_brand_extras(
     if db.scalar(
         select(Inventory.id).where(
             Inventory.franchise_owner_id == owner.id,
-            Inventory.item_name == f"{DEMO} Stok — {brand.id}",
+            Inventory.item_name == f"Stok — {brand.name[:30]}",
         )
     ) is None:
         db.add(
             Inventory(
                 franchise_owner_id=owner.id,
-                item_name=f"{DEMO} Stok — {brand.id}",
+                item_name=f"Stok — {brand.name[:30]}",
                 stock_level=random.randint(20, 200),
                 low_stock_threshold=15,
             )
@@ -223,13 +223,13 @@ def _seed_brand_extras(
     if db.scalar(
         select(SupplyRequest.id).where(
             SupplyRequest.franchise_owner_id == owner.id,
-            SupplyRequest.product_name == f"{DEMO} Tedarik — {brand.id}",
+            SupplyRequest.product_name == f"Tedarik — {brand.name[:30]}",
         )
     ) is None:
         db.add(
             SupplyRequest(
                 franchise_owner_id=owner.id,
-                product_name=f"{DEMO} Tedarik — {brand.id}",
+                product_name=f"Tedarik — {brand.name[:30]}",
                 quantity=random.randint(10, 100),
                 status=SupplyRequestStatus.pending,
             )
@@ -238,13 +238,13 @@ def _seed_brand_extras(
     if db.scalar(
         select(FranchiseOwnerDocument.id).where(
             FranchiseOwnerDocument.franchise_owner_id == owner.id,
-            FranchiseOwnerDocument.title == f"{DEMO} SOP — {brand.id}",
+            FranchiseOwnerDocument.title == f"Operasyon El Kitabı — {brand.name[:30]}",
         )
     ) is None:
         db.add(
             FranchiseOwnerDocument(
                 franchise_owner_id=owner.id,
-                title=f"{DEMO} SOP — {brand.id}",
+                title=f"Operasyon El Kitabı — {brand.name[:30]}",
                 document_type=OwnerDocumentType.sop,
                 file_path=_write_placeholder(f"seed/owners/{owner.id}/sop_{brand.id}.pdf"),
                 mime_type="application/pdf",
@@ -341,7 +341,7 @@ def seed(*, num_buyers: int = 30, num_owners: int = 30) -> None:
             buyer = buyer_by_email[bem]
             brand = brand_by_name[bname]
             status = _STATUS_MAP[status_str]
-            notes = f"{DEMO} {note}".strip() if note else f"{DEMO} Başvuru"
+            notes = note.strip() if note else "Başvuru"
             app = db.scalar(
                 select(Application).where(
                     Application.buyer_id == buyer.id,
