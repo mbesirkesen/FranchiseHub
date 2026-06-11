@@ -25,10 +25,11 @@ from ..models import (
     UserRole,
 )
 from ..schemas import (
-    ApplicationListEnvelope,
     ApplicationRead,
     ApplicationUpdate,
     AuthenticatedPrincipal,
+    OwnerApplicationListEnvelope,
+    OwnerApplicationListItem,
     BrandFDDRead,
     BrandFDDUploadResponse,
     BrandMediaUploadResponse,
@@ -348,7 +349,7 @@ async def upload_brand_fdd(
 
 @router.get(
     "/applications/my-brand",
-    response_model=ApplicationListEnvelope,
+    response_model=OwnerApplicationListEnvelope,
     dependencies=[Depends(require_roles(UserRole.franchise_owner))],
 )
 def list_my_brand_applications(
@@ -360,17 +361,32 @@ def list_my_brand_applications(
     brand_ids = get_owned_brand_ids(db, current_user)
     if not brand_ids:
         meta = paginated_meta(0, page, page_size)
-        return ApplicationListEnvelope(items=[], **meta)
-    stmt = (
-        select(Application)
+        return OwnerApplicationListEnvelope(items=[], **meta)
+    base = (
+        select(Application, Buyer, Brand)
+        .join(Buyer, Application.buyer_id == Buyer.id)
+        .join(Brand, Application.brand_id == Brand.id)
         .where(Application.brand_id.in_(brand_ids))
         .order_by(Application.created_at.desc(), Application.id.desc())
     )
-    total = int(db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    total = int(db.scalar(select(func.count()).select_from(base.subquery())) or 0)
     offset = (page - 1) * page_size
-    rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
+    rows = db.execute(base.offset(offset).limit(page_size)).all()
+    items = [
+        OwnerApplicationListItem(
+            id=app.id,
+            buyer_id=app.buyer_id,
+            brand_id=app.brand_id,
+            status=app.status,
+            notes=app.notes,
+            created_at=app.created_at,
+            buyer_name=f"{buyer.first_name} {buyer.last_name}".strip() or buyer.email,
+            brand_name=brand.name,
+        )
+        for app, buyer, brand in rows
+    ]
     meta = paginated_meta(total, page, page_size)
-    return ApplicationListEnvelope(items=list(rows), **meta)
+    return OwnerApplicationListEnvelope(items=items, **meta)
 
 
 @router.patch(
