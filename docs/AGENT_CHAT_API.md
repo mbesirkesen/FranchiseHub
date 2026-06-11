@@ -61,7 +61,30 @@ OPENAI_BASE_URL=https://api.groq.com/openai/v1
 OPENAI_MODEL=llama-3.3-70b-versatile
 ```
 
-LLM yalnızca cevap metnini cilar; marka listesi her zaman veritabanından gelir.
+LLM iki modda çalışır:
+- **Tool routing** (`AGENT_LLM_ROUTING_ENABLED=true`): LLM tool seçer → sonuç DB'den (`source: llm_tools`)
+- **Metin cilası**: Taslak cevabı Türkçeleştirir (`source: hybrid`)
+
+Marka listesi ve fiyatlar her zaman veritabanından gelir; LLM uydurmaz.
+
+## Semantik arama (pgvector / RAG)
+
+Kelime tam eşleşmeyen sorgularda (ör. "araba tamiri", "çocuk eğitimi", "kahvaltı mekanı")
+kural-tabanlı arama boş kalır veya alakasız genel listeye düşerse, semantik fallback
+devreye girer (`source: semantic`).
+
+- Vektör deposu: Neon PostgreSQL + `pgvector` (`brand_embeddings` tablosu, `vector(384)`).
+- Embedding: yerel `fastembed` / `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
+- Markalar lazy indexlenir; toplu indexleme: `python scripts/reindex_brands.py`.
+- `.env`: `AGENT_EMBEDDING_ENABLED` (varsayılan true), `AGENT_EMBEDDING_MODEL`,
+  `AGENT_SEMANTIC_MAX_DISTANCE` (varsayılan 0.55).
+- Model yüklenemezse semantik arama sessizce devre dışı kalır; chatbot kural+DB ile çalışır.
+
+Migration: `migrations/20260611_brand_embeddings.sql`.
+
+`source` değerleri: `rules` | `hybrid` | `llm_tools` | `semantic`.
+
+`GET /agent/metrics` — intent / no_match istatistikleri (geliştirme).
 
 ## Migration
 

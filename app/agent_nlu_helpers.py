@@ -34,6 +34,9 @@ QUERY_STOP_WORDS = frozenset(
         "listele", "gosterir", "gösterir", "bak", "bakalim", "bakalım", "acaba",
         "cok", "çok", "az", "daha", "bana", "size", "siz", "benim", "ben", "su", "şu",
         "bu", "da", "de", "ta", "te", "ki", "mi", "mu", "mü", "midir", "mıdır",
+        "arasi", "arası", "ila", "ustu", "üstü", "uzeri", "üzeri", "baska", "başka",
+        "sektor", "sektör", "sektoru", "sektörü", "fiyat", "band", "bandi", "bandında",
+        "bandinda", "ayni", "aynı",
     }
 )
 

@@ -10,11 +10,13 @@ from .agent_config import AGENT_CONTEXT_MESSAGE_LIMIT
 from .agent_context import load_buyer_context
 from .agent_rate_limit import check_agent_rate_limit
 from .agent_sanitize import sanitize_agent_query
+from .agent_metrics import record_agent_turn
 from .agent_session_store import (
     append_message,
     create_session,
     get_session_for_buyer,
     last_brand_search_state,
+    load_session_snapshot,
     recent_turns,
 )
 from .buyer_assistant import answer_buyer_assistant
@@ -35,7 +37,7 @@ def run_agent_turn(
     buyer: Buyer,
     payload: AssistantChatRequest,
 ) -> AssistantQueryResponse:
-    check_agent_rate_limit(buyer.id)
+    check_agent_rate_limit(f"buyer:{buyer.id}")
 
     try:
         return _run_agent_turn_inner(db, buyer, payload)
@@ -78,7 +80,10 @@ def _run_agent_turn_inner(
     ctx = load_buyer_context(db, buyer)
     if session:
         ctx.recent_turns = recent_turns(db, session.id, AGENT_CONTEXT_MESSAGE_LIMIT)
-        ctx.last_search_state = last_brand_search_state(db, session.id)
+        ctx.session_snapshot = load_session_snapshot(db, session.id)
+        ctx.last_search_state = ctx.session_snapshot or last_brand_search_state(
+            db, session.id
+        )
 
     append_message(
         db,
@@ -108,6 +113,12 @@ def _run_agent_turn_inner(
     response.session_id = session.id
     response.message_id = assistant_msg.id
 
+    record_agent_turn(
+        intent=response.intent,
+        source=response.source,
+        query=query,
+        brand_count=len(response.related_brand_ids),
+    )
     _log.info(
         "agent_turn buyer_id=%s session_id=%s intent=%s source=%s brands=%s latency_ms=%s query=%s",
         buyer.id,
@@ -129,7 +140,7 @@ def run_agent_query_only(
     payload: AssistantQueryRequest,
 ) -> AssistantQueryResponse:
     """Stateless — oturum kaydı yok; POST /agent/query için."""
-    check_agent_rate_limit(buyer.id)
+    check_agent_rate_limit(f"buyer:{buyer.id}")
     query = sanitize_agent_query(payload.query)
     req = AssistantQueryRequest(
         query=query,
@@ -138,6 +149,12 @@ def run_agent_query_only(
     )
     ctx = load_buyer_context(db, buyer)
     response = answer_buyer_assistant(db, buyer, req, ctx)
+    record_agent_turn(
+        intent=response.intent,
+        source=response.source,
+        query=query,
+        brand_count=len(response.related_brand_ids),
+    )
     _log.info(
         "agent_query buyer_id=%s intent=%s source=%s latency_ms=%s",
         buyer.id,

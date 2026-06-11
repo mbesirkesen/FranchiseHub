@@ -5,11 +5,20 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from ..agent_metrics import snapshot_metrics
 from ..agent_service import run_agent_query_only, run_agent_turn
-from ..agent_session_store import delete_session, list_sessions, session_messages
+from ..agent_session_store import (
+    delete_session,
+    delete_session_for_owner,
+    list_sessions,
+    list_sessions_for_owner,
+    session_messages,
+    session_messages_for_owner,
+)
 from ..database import get_db
 from ..dependencies import get_current_principal, require_roles
-from ..models import Buyer, UserRole
+from ..fo_agent_service import run_fo_agent_query_only, run_fo_agent_turn
+from ..models import Buyer, FranchiseOwner, UserRole
 from ..schemas import (
     AgentMessageRead,
     AgentSessionDetailResponse,
@@ -28,6 +37,15 @@ def _get_buyer(db: Session, current_user: AuthenticatedPrincipal) -> Buyer:
     if not buyer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Buyer not found")
     return buyer
+
+
+def _get_franchise_owner(db: Session, current_user: AuthenticatedPrincipal) -> FranchiseOwner:
+    owner = db.get(FranchiseOwner, current_user.user_id)
+    if not owner:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Franchise owner not found"
+        )
+    return owner
 
 
 @router.post(
@@ -72,6 +90,15 @@ def agent_query(
 
 
 @router.get(
+    "/metrics",
+    dependencies=[Depends(require_roles(UserRole.buyer))],
+)
+def agent_metrics():
+    """Geliştirme: intent/no_match istatistikleri (bellek içi)."""
+    return snapshot_metrics()
+
+
+@router.get(
     "/sessions",
     response_model=list[AgentSessionRead],
     dependencies=[Depends(require_roles(UserRole.buyer))],
@@ -112,6 +139,91 @@ def remove_agent_session(
     current_user: AuthenticatedPrincipal = Depends(get_current_principal),
 ):
     if not delete_session(db, session_id, current_user.user_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    db.commit()
+    return None
+
+
+# --- Franchise owner asistanı ---
+
+
+@router.post(
+    "/fo/chat",
+    response_model=AssistantQueryResponse,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def fo_agent_chat(
+    payload: AssistantChatRequest,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    owner = _get_franchise_owner(db, current_user)
+    try:
+        return run_fo_agent_turn(db, owner, payload)
+    except ValueError as exc:
+        if str(exc) == "session_message_limit":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Bu sohbet mesaj limitine ulaştı. Yeni sohbet başlatın.",
+            ) from exc
+        raise
+
+
+@router.post(
+    "/fo/query",
+    response_model=AssistantQueryResponse,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def fo_agent_query(
+    payload: AssistantQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    owner = _get_franchise_owner(db, current_user)
+    return run_fo_agent_query_only(db, owner, payload)
+
+
+@router.get(
+    "/fo/sessions",
+    response_model=list[AgentSessionRead],
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def list_fo_agent_sessions(
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    return list_sessions_for_owner(db, current_user.user_id)
+
+
+@router.get(
+    "/fo/sessions/{session_id}",
+    response_model=AgentSessionDetailResponse,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def get_fo_agent_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    sessions = list_sessions_for_owner(db, current_user.user_id, limit=100)
+    meta = next((s for s in sessions if s.id == session_id), None)
+    if not meta:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    messages = session_messages_for_owner(db, session_id, current_user.user_id)
+    return AgentSessionDetailResponse(session=meta, messages=messages)
+
+
+@router.delete(
+    "/fo/sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_roles(UserRole.franchise_owner))],
+)
+def remove_fo_agent_session(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedPrincipal = Depends(get_current_principal),
+):
+    if not delete_session_for_owner(db, session_id, current_user.user_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     db.commit()
     return None

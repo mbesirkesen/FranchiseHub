@@ -4,7 +4,7 @@ import math
 from typing import Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from .file_tokens import build_media_public_url
@@ -57,9 +57,40 @@ def apply_brand_filters(
     if sector:
         stmt = stmt.where(Brand.sector.ilike(f"%{sector}%"))
     if min_cost is not None:
-        stmt = stmt.where(Brand.initial_cost >= min_cost)
+        stmt = stmt.where(
+            or_(
+                and_(Brand.initial_cost.isnot(None), Brand.initial_cost >= min_cost),
+                and_(Brand.min_investment_cost.isnot(None), Brand.min_investment_cost >= min_cost),
+            )
+        )
     if max_cost is not None:
-        stmt = stmt.where(Brand.initial_cost <= max_cost)
+        # Bütçe filtresi: markanın gerektirdiği minimum yatırım <= max_cost
+        affordable = or_(
+            and_(
+                Brand.min_investment_cost.isnot(None),
+                Brand.min_investment_cost > 0,
+                Brand.min_investment_cost <= max_cost,
+            ),
+            and_(
+                or_(Brand.min_investment_cost.is_(None), Brand.min_investment_cost <= 0),
+                Brand.initial_cost.isnot(None),
+                Brand.initial_cost > 0,
+                Brand.initial_cost <= max_cost,
+            ),
+            and_(
+                or_(Brand.min_investment_cost.is_(None), Brand.min_investment_cost <= 0),
+                or_(Brand.initial_cost.is_(None), Brand.initial_cost <= 0),
+                Brand.max_investment_cost.isnot(None),
+                Brand.max_investment_cost > 0,
+                Brand.max_investment_cost <= max_cost,
+            ),
+            and_(
+                or_(Brand.min_investment_cost.is_(None), Brand.min_investment_cost <= 0),
+                or_(Brand.initial_cost.is_(None), Brand.initial_cost <= 0),
+                or_(Brand.max_investment_cost.is_(None), Brand.max_investment_cost <= 0),
+            ),
+        )
+        stmt = stmt.where(affordable)
     if location:
         stmt = stmt.where(Brand.location.ilike(f"%{location}%"))
     if region:
@@ -134,6 +165,16 @@ def list_approved_brands(
     return items, total
 
 
+def list_brand_sectors(db: Session) -> list[str]:
+    rows = db.scalars(
+        select(Brand.sector)
+        .where(Brand.is_approved.is_(True), Brand.sector.isnot(None), Brand.sector != "")
+        .distinct()
+        .order_by(Brand.sector.asc())
+    ).all()
+    return [s.strip() for s in rows if s and s.strip()]
+
+
 def total_pages(total: int, page_size: int) -> int:
     if total == 0:
         return 0
@@ -150,7 +191,23 @@ _COMPARE_FIELDS: list[tuple[str, str, str]] = [
 ]
 
 
-def build_compare_response(brands: list[Brand]) -> BrandCompareResponse:
+def _format_city_list(cities: list[str], *, limit: int = 4) -> str:
+    if not cities:
+        return "—"
+    shown = cities[:limit]
+    text = ", ".join(shown)
+    if len(cities) > limit:
+        text += f" (+{len(cities) - limit} şehir)"
+    return text
+
+
+def build_compare_response(
+    brands: list[Brand],
+    *,
+    snapshots: Optional[dict[int, object]] = None,
+    roi_map: Optional[dict[int, float]] = None,
+    insights: Optional[str] = None,
+) -> BrandCompareResponse:
     ordered = sorted(brands, key=lambda b: b.id)
     items = [BrandCompareItem.model_validate(b) for b in ordered]
     columns = [BrandCompareColumn(brand_id=b.id, name=b.name) for b in ordered]
@@ -166,6 +223,41 @@ def build_compare_response(brands: list[Brand]) -> BrandCompareResponse:
             else:
                 values.append(str(raw))
         rows.append(BrandCompareRow(key=key, label=label, values=values))
+
+    if snapshots:
+        metric_rows: list[tuple[str, str, list[Optional[str]]]] = [
+            ("outlet_count", "Şube sayısı", []),
+            ("years_active", "Faaliyet süresi", []),
+            ("outlet_cities", "Şube şehirleri", []),
+            ("approved_franchises", "Onaylı bayilik", []),
+            ("estimated_roi", "Tahmini ROI", []),
+        ]
+        for brand in ordered:
+            snap = snapshots.get(brand.id)
+            active = getattr(snap, "active_outlet_count", 0) if snap else 0
+            total = getattr(snap, "outlet_count", 0) if snap else 0
+            years = getattr(snap, "years_active", None) if snap else None
+            cities = getattr(snap, "outlet_cities", []) if snap else []
+            approved = getattr(snap, "approved_franchise_count", 0) if snap else 0
+            roi = (roi_map or {}).get(brand.id)
+
+            metric_rows[0][2].append(
+                str(active) if active else (str(total) if total else "—")
+            )
+            metric_rows[1][2].append(f"~{years} yıl" if years else "—")
+            metric_rows[2][2].append(_format_city_list(cities))
+            metric_rows[3][2].append(str(approved) if approved else "—")
+            metric_rows[4][2].append(f"%{roi:.1f}" if roi is not None else "—")
+
+        insert_at = next(
+            (i for i, r in enumerate(rows) if r.key == "initial_cost"),
+            len(rows),
+        ) + 1
+        for offset, (key, label, values) in enumerate(metric_rows):
+            rows.insert(
+                insert_at + offset,
+                BrandCompareRow(key=key, label=label, values=values),
+            )
     financial_summaries = [
         BrandFinancialSummary(
             brand_id=b.id,
@@ -183,6 +275,7 @@ def build_compare_response(brands: list[Brand]) -> BrandCompareResponse:
         brands=items,
         comparison_table=BrandCompareTable(columns=columns, rows=rows),
         financial_summaries=financial_summaries,
+        insights=insights,
     )
 
 

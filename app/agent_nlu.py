@@ -54,6 +54,45 @@ CITY_KEYWORDS: dict[str, str] = {
 }
 
 COMPARE_HINTS = ("karşılaştır", "karsilastir", "compare")
+COMPARE_WITH_OWNED_HINTS = (
+    "bende olan",
+    "bende ki",
+    "bendeki",
+    "mevcut bayilik",
+    "onayli bayilik",
+    "onaylı bayilik",
+    "bayiliklerim",
+    "bayiliklerimle",
+    "sahip oldugum",
+    "sahip olduğum",
+    "elimdeki",
+    "su an bende",
+    "şu an bende",
+    "aktif bayilik",
+    "bayiligim",
+    "bayiliğim",
+)
+COMPARE_WITH_PREVIOUS_HINTS = (
+    "digerleriyle",
+    "diğerleriyle",
+    "onceki liste",
+    "önceki liste",
+    "listedeki",
+    "gosterdigin",
+    "gösterdiğin",
+    "az once",
+    "az önce",
+    "yukaridaki",
+    "yukarıdaki",
+    "bir daha",
+    "tekrar",
+    "yeniden",
+    "yine",
+    "ayni karsilastir",
+    "aynı karşılaştır",
+    "son karsilastir",
+    "son karşılaştır",
+)
 DETAIL_HINTS = ("roi", "getiri", "trend", "şube", "sube", "metrik", "kaç şube", "büyüme")
 APPLICATION_HINTS = ("başvuru", "basvuru", "application", "başvurum", "basvurum", "durumda", "başvurularım", "basvurularim")
 GENERAL_HINTS = ("franchise nedir", "bayilik nedir", "nasıl çalışır", "nasil calisir")
@@ -66,11 +105,17 @@ HELP_HINTS = (
     "ne yaparsin", "ne yaparsın", "komutlar", "ornek soru", "örnek soru",
 )
 THANKS_HINTS = ("tesekkur", "teşekkür", "sagol", "sağol", "eyvallah", "tamamdir", "tamamdır")
+# Kişisel öneri: profil sektörü/bütçesi devreye girebilir
 RECOMMEND_HINTS = (
     "onerir", "önerir", "tavsiye", "ne onerirsin", "ne önerirsin", "bana uygun",
     "uygun marka", "öneri", "oneri", "goster bana", "göster bana", "bul bana",
-    "bir sey oner", "bir şey öner", "ne var", "neler var", "hangi markalar",
-    "listele", "gosterir misin", "gösterir misin",
+    "bir sey oner", "bir şey öner", "bana gore", "bana göre",
+)
+# Genel listeleme: profil filtreleri EKLENMEZ, ham liste döner
+GENERAL_LIST_HINTS = (
+    "ne var", "neler var", "hangi markalar", "hangi marka", "listele",
+    "gosterir misin", "gösterir misin", "tum markalar", "tüm markalar",
+    "hepsi", "hepsini", "markalar neler",
 )
 PRODUCT_KEYWORDS = (
     "pizza", "doner", "döner", "burger", "waffle", "tatli", "tatlı", "cicek", "çiçek",
@@ -179,6 +224,8 @@ class AgentNluResult:
     filters: AgentSearchFilters = field(default_factory=AgentSearchFilters)
     free_text_tokens: list[str] = field(default_factory=list)
     compare_brand_names: list[str] = field(default_factory=list)
+    compare_with_owned: bool = False
+    compare_with_previous: bool = False
     pick_mode: Optional[str] = None  # cheapest | expensive | best_match | best_roi | ordinal
     pick_index: Optional[int] = None
     db_brand_ids: list[int] = field(default_factory=list)
@@ -213,24 +260,50 @@ def _parse_money_tl(text: str) -> tuple[Optional[float], Optional[float]]:
             unit = m.group(2) if m.lastindex and m.lastindex >= 2 else ""
             amounts.append((_amount_from_match(m.group(1), unit), m.group(0)))
 
-    if not amounts and re.search(r"\b(\d{4,7})\b", norm):
-        for m in re.finditer(r"\b(\d{4,7})\b", norm):
+    if not amounts and re.search(r"\b(\d{4,12})\b", norm):
+        for m in re.finditer(r"\b(\d{4,12})\b", norm):
             amounts.append((float(m.group(1)), m.group(0)))
+
+    # "X ile Y arası" / "X - Y arası" / "X ila Y" → aralık (min, max)
+    range_signal = any(
+        w in norm for w in ("arasi", "arası", " ile ", " ila ", "araliginda", "aralığında")
+    ) or re.search(r"\d\s*[-–]\s*\d", norm)
+    if len(amounts) >= 2 and range_signal:
+        values = sorted(v for v, _ in amounts)
+        return values[0], values[-1]
 
     for value, fragment in amounts:
         if any(w in fragment for w in ("alti", "altı", "under", "kadar", "max")) or any(
             w in norm for w in ("alti", "altı", "kadar", "under", "max")
         ):
             max_cost = value if max_cost is None else min(max_cost, value)
-        elif any(w in norm for w in ("ustu", "üstü", "min", "en az")):
+        elif any(w in norm for w in ("ustu", "üstü", "min", "en az", "uzeri", "üzeri")):
             min_cost = value if min_cost is None else max(min_cost, value)
         else:
             max_cost = value if max_cost is None else min(max_cost, value)
 
-    if re.search(r"butceme|bütçeme|butcem|bütçem", norm):
-        return None, None  # profil bütçesi — caller işler
+    # "bütçem" geçse de açık bir tutar yazıldıysa onu kullan; yoksa profil
+    # bütçesini caller işler.
+    if min_cost is None and max_cost is None and re.search(
+        r"butceme|bütçeme|butcem|bütçem", norm
+    ):
+        return None, None
 
     return min_cost, max_cost
+
+
+def _query_has_explicit_budget(
+    norm: str,
+    min_parsed: Optional[float],
+    max_parsed: Optional[float],
+) -> bool:
+    """Sorguda yazılı tutar varsa profil sektörü gibi daraltıcı varsayılanları zayıflat."""
+    if min_parsed is not None or max_parsed is not None:
+        return True
+    return bool(
+        re.search(r"\d{5,}", norm)
+        or re.search(r"\d+\s*(milyon|bin|tl)\b", norm)
+    )
 
 
 def _detect_sector(norm: str, vocabulary: Optional[AgentVocabulary] = None) -> Optional[str]:
@@ -240,6 +313,10 @@ def _detect_sector(norm: str, vocabulary: Optional[AgentVocabulary] = None) -> O
             return matched
     for keywords, sector in SECTOR_KEYWORDS:
         if any(kw in norm for kw in keywords):
+            # Sözlük varsa, keyword eşlemesi DB'de gerçekten olmayan bir sektöre
+            # işaret ediyorsa (ör. "Spor") uygulama — aksi halde 0 sonuç + alakasız öneri.
+            if vocabulary and vocabulary.sectors and sector not in vocabulary.sectors:
+                return None
             return sector
     return None
 
@@ -267,12 +344,32 @@ def _detect_city(
     return None
 
 
-def _is_compare_intent(norm: str, raw: str) -> bool:
-    if any(h in norm for h in COMPARE_HINTS) or " vs " in norm:
+def _is_compare_with_owned_franchises(norm: str) -> bool:
+    if any(h in norm for h in COMPARE_WITH_OWNED_HINTS):
         return True
+    return "bayilik" in norm and any(w in norm for w in ("bende", "benim", "sahibiyim"))
+
+
+def _is_compare_with_previous_list(norm: str) -> bool:
+    return any(h in norm for h in COMPARE_WITH_PREVIOUS_HINTS)
+
+
+def _is_compare_intent(norm: str, raw: str) -> bool:
+    # Para/bütçe aralığı ("500 bin ile 1 milyon arası") karşılaştırma değildir.
+    money_present = bool(re.search(r"\d+\s*(bin|milyon|tl|k|m)\b", norm)) or any(
+        w in norm for w in ("arasi", "arası", "butce", "bütçe", "alti", "altı")
+    )
+    if any(h in norm for h in COMPARE_HINTS) or " vs " in norm:
+        # "karşılaştır" açıkça varsa compare; ama yalnızca para varsa değil
+        if not money_present or len(extract_compare_brand_names(raw)) >= 2:
+            return True
     # «Komagene ile Brew Max» — yalnızca karşılaştırma fiili veya iki marka adı
-    if re.search(r"\s+ile\s+", norm) and not re.search(
-        r"ne yapabilirim|ne yapabilir|nasil|nasıl|yapmak|istiyorum", norm
+    if (
+        re.search(r"\s+ile\s+", norm)
+        and not money_present
+        and not re.search(
+            r"ne yapabilirim|ne yapabilir|nasil|nasıl|yapmak|istiyorum", norm
+        )
     ):
         names = extract_compare_brand_names(raw)
         if len(names) >= 2:
@@ -310,18 +407,34 @@ def _is_gibberish(norm: str) -> bool:
     return not any(w in norm for w in ("franchise", "bayilik", "marka"))
 
 
+_COMPARE_STOP_TOKENS = frozenset(
+    {
+        "marka", "markalar", "franchise", "bayilik", "hangisi", "daha", "iyi",
+        "misin", "musun", "musunuz", "misiniz", "misin", "lutfen", "lütfen",
+        "icin", "için", "bana", "benim", "ile", "ver", "eder",
+        "bin", "milyon", "tl", "arasi", "arası", "alti", "altı", "ustu", "üstü",
+        "butce", "bütçe", "butcem", "bütçem",
+    }
+)
+
+
 def extract_compare_brand_names(query: str) -> list[str]:
     norm = _normalize(query)
-    for token in ("karsilastir", "karşılaştır", "compare", "markalari", "markaları"):
+    # Tüm "karşılaştır..." varyantlarını (karsilastirir, karsilastirabilir) temizle
+    norm = re.sub(r"kar[sş][iı]la[sş]t[iı]r\w*", " ", norm)
+    for token in ("compare", "markalari", "markaları", "kiyasla", "kıyasla"):
         norm = norm.replace(token, " ")
     parts = re.split(r"\s+(?:ile|ve|vs|veya)\s+", norm)
     names: list[str] = []
     for part in parts:
-        cleaned = re.sub(r"[^a-z0-9\s]", " ", part).strip()
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", part)
+        # Soru ekleri / genel kelimeleri / salt sayıları at
+        tokens = [
+            t for t in cleaned.split()
+            if t not in _COMPARE_STOP_TOKENS and not t.isdigit()
+        ]
+        cleaned = " ".join(tokens).strip()
         if len(cleaned) < 3:
-            continue
-        # Çok genel kelimeleri at
-        if cleaned in ("marka", "franchise", "bayilik", "hangisi", "daha", "iyi"):
             continue
         title = " ".join(w.capitalize() for w in cleaned.split())
         if title and title not in names:
@@ -361,7 +474,7 @@ def classify_intent(query: str, brand_id: Optional[int]) -> str:
         return "no_match"
     has_money = bool(
         re.search(r"\d+\s*(bin|k|milyon|m\b|tl\b)", norm)
-        or re.search(r"\b\d{4,9}\b", norm)
+        or re.search(r"\b\d{4,12}\b", norm)
         or "butce" in norm
         or "bütç" in norm
     )
@@ -574,8 +687,12 @@ def parse_agent_query(
         filters.q = None
 
     compare_names: list[str] = []
+    compare_with_owned = False
+    compare_with_previous = False
     if intent == "brand_compare":
         compare_names = extract_compare_brand_names(raw)
+        compare_with_owned = _is_compare_with_owned_franchises(norm)
+        compare_with_previous = _is_compare_with_previous_list(norm)
 
     if any(h in norm for h in EXCLUDE_APPLIED_HINTS):
         filters.exclude_applied = True
@@ -618,13 +735,31 @@ def parse_agent_query(
     # Profil varsayılanları — yalnızca anlamlı brand_search sorgularında
     if intent == "brand_search":
         _apply_conversational_filters(filters, norm, buyer)
+        # Kullanıcı şehir/bölge belirttiyse veya "hangi markalar var" gibi genel
+        # listeleme yaptıysa profil sektör/bütçesini ZORLA ekleme — aksi halde
+        # sonuçlar gereksiz daralır.
+        user_scoped = filters.location is not None or filters.region is not None
+        general_list = any(h in norm for h in GENERAL_LIST_HINTS)
+        # "başka/farklı sektör öner" → kullanıcı çeşitlilik istiyor; profil sektörünü
+        # (tek sektör) zorlamak yanlış olur, sektörsüz genel öneri ver.
+        wants_other = (
+            any(w in norm for w in ("baska", "başka", "farkli", "farklı", "degisik", "değişik", "diger", "diğer"))
+            and "sekt" in norm
+        )
+        allow_profile_defaults = not user_scoped and not general_list and not wants_other
+        explicit_budget = _query_has_explicit_budget(norm, min_parsed, max_parsed)
         if filters.max_cost is None and filters.use_profile_budget:
             filters.max_cost = float(buyer.investment_budget)
-        if filters.sector is None and (
-            filters.use_profile_budget
-            or re.search(
-                r"butceme|bütçeme|öner|oner|uygun|tavsiye|bana uygun|ne onerirsin|ne önerirsin",
-                norm,
+        if (
+            allow_profile_defaults
+            and not explicit_budget
+            and filters.sector is None
+            and (
+                filters.use_profile_budget
+                or re.search(
+                    r"butceme|bütçeme|öner|oner|tavsiye|bana uygun|ne onerirsin|ne önerirsin",
+                    norm,
+                )
             )
         ):
             if buyer.preferred_sector:
@@ -635,20 +770,21 @@ def parse_agent_query(
                 filters.use_profile_city = True
                 filters.location = buyer.city
         if (
-            filters.sector is None
+            allow_profile_defaults
+            and filters.sector is None
             and filters.max_cost is None
             and not filters.q
             and any(h in norm for h in RECOMMEND_HINTS)
         ):
             filters.use_profile_budget = True
             filters.max_cost = float(buyer.investment_budget)
-            if buyer.preferred_sector:
+            if buyer.preferred_sector and not explicit_budget:
                 filters.use_profile_sector = True
                 filters.sector = buyer.preferred_sector
         if filters.max_cost is not None and re.search(r"ne yapabilirim|ne yapabilir", norm):
             if filters.q in ("ile", "ve", "ne"):
                 filters.q = None
-            if buyer.preferred_sector and filters.sector is None:
+            if buyer.preferred_sector and filters.sector is None and not explicit_budget:
                 filters.sector = buyer.preferred_sector
                 filters.use_profile_sector = True
         if (
@@ -667,6 +803,8 @@ def parse_agent_query(
         filters=filters,
         free_text_tokens=free,
         compare_brand_names=compare_names,
+        compare_with_owned=compare_with_owned,
+        compare_with_previous=compare_with_previous,
         pick_mode=pick_mode if intent == "brand_pick" else None,
         pick_index=pick_index if intent == "brand_pick" else None,
         db_brand_ids=db_brand_ids,

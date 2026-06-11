@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Franchise asistanı smoke test — backend hazır mı kontrolü."""
+"""Franchise asistanı smoke + konuşma testleri."""
 
 from __future__ import annotations
 
@@ -77,10 +77,23 @@ def main() -> int:
 
     cases = [
         ("brand_search", {"query": "500 bin TL altı gıda markaları"}, lambda d: d["intent"] == "brand_search" and len(d.get("brands") or []) > 0),
-        ("brand_compare", {"query": "Komagene ile Brew Max karşılaştır"}, lambda d: d["intent"] == "brand_compare" and len(d.get("brands") or []) >= 2),
+        (
+            "brand_compare",
+            {"query": "Komagene ile Brew Max karşılaştır"},
+            lambda d: (
+                d["intent"] == "brand_compare"
+                and len(d.get("brands") or []) >= 2
+                and "operasyonel özet" in (d.get("answer") or "").lower()
+            ),
+        ),
+        ("brand_compare_owned", {"query": "bende olan bayiliklerimle karşılaştır"}, lambda d: d["intent"] == "brand_compare" and (d.get("compare") is not None or len(d.get("brands") or []) >= 2)),
         ("application_status", {"query": "başvurum ne durumda"}, lambda d: d["intent"] == "application_status"),
         ("favorites_similar", {"query": "favorilerime benzer markalar"}, lambda d: d["intent"] == "favorites_similar"),
         ("match_score_ratio", {"query": "kafe franchise"}, lambda d: bool((d.get("brands") or [{}])[0].get("match_score_ratio") is not None)),
+        ("greeting", {"query": "merhaba"}, lambda d: d["intent"] == "general"),
+        ("recommend", {"query": "ne önerirsin"}, lambda d: d["intent"] == "brand_search" and len(d.get("brands") or []) > 0),
+        ("pizza", {"query": "pizza var mı"}, lambda d: d["intent"] == "brand_search" and len(d.get("brands") or []) > 0),
+        ("money_question", {"query": "1 milyon tl ile ne yapabilirim"}, lambda d: d["intent"] == "brand_search" and len(d.get("brands") or []) > 0),
     ]
     for name, body, check in cases:
         status, data = _request(args.base, "POST", "/agent/query", token=token, body=body)
@@ -96,31 +109,23 @@ def main() -> int:
     assert_ok("chat_turn_1", status == 200 and chat1.get("intent") == "brand_search")
     sid = chat1.get("session_id")
 
-    status, chat2 = _request(
-        args.base,
-        "POST",
-        "/agent/chat",
-        token=token,
-        body={"query": "daha ucuz olanlar", "session_id": sid},
-    )
-    assert_ok(
-        "chat_followup_cheaper",
-        status == 200 and chat2.get("intent") == "brand_search" and len(chat2.get("brands") or []) > 0,
-    )
+    followups = [
+        ("chat_followup_cheaper", "daha ucuz olanlar", lambda d: d.get("intent") == "brand_search" and len(d.get("brands") or []) > 0),
+        ("chat_followup_sector", "gıda olsun", lambda d: d.get("intent") == "brand_search" and d.get("filters_applied", {}).get("sector") == "Gıda"),
+        ("chat_pick_cheapest", "en ucuzu hangisi", lambda d: d.get("intent") == "brand_pick" and len(d.get("brands") or []) == 1),
+        ("chat_thanks", "teşekkürler", lambda d: d.get("intent") == "general"),
+    ]
+    for name, query, check in followups:
+        status, data = _request(
+            args.base,
+            "POST",
+            "/agent/chat",
+            token=token,
+            body={"query": query, "session_id": sid},
+        )
+        assert_ok(name, status == 200 and check(data), json.dumps(data, ensure_ascii=False)[:200])
 
-    status, chat3 = _request(
-        args.base,
-        "POST",
-        "/agent/chat",
-        token=token,
-        body={"query": "gıda olsun", "session_id": sid},
-    )
-    assert_ok(
-        "chat_followup_sector",
-        status == 200 and chat3.get("intent") == "brand_search" and chat3.get("filters_applied", {}).get("sector") == "Gıda",
-    )
-
-    print("\nTüm agent smoke testleri geçti.")
+    print("\nTüm agent testleri geçti.")
     return 0
 
 

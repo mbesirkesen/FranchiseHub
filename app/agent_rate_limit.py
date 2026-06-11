@@ -9,17 +9,18 @@ from fastapi import HTTPException, status
 from .agent_config import AGENT_RATE_LIMIT_PER_MINUTE
 
 _lock = threading.Lock()
-_buckets: dict[int, deque[float]] = defaultdict(deque)
+_buckets: dict[str, deque[float]] = defaultdict(deque)
 
 
-def check_agent_rate_limit(buyer_id: int) -> None:
+def check_agent_rate_limit(principal_key: str | int) -> None:
     """Tek sunucu için sliding window. Çoklu instance için Redis gerekir."""
+    key = str(principal_key)
     now = time.monotonic()
     window = 60.0
     limit = AGENT_RATE_LIMIT_PER_MINUTE
 
     with _lock:
-        bucket = _buckets[buyer_id]
+        bucket = _buckets[key]
         while bucket and bucket[0] <= now - window:
             bucket.popleft()
         if len(bucket) >= limit:

@@ -17,6 +17,7 @@ class AgentBuyerContext:
     applied_brand_ids: list[int] = field(default_factory=list)
     recent_turns: list[tuple[str, str]] = field(default_factory=list)  # (role, content)
     last_search_state: Optional[dict] = None  # {filters_applied, related_brand_ids}
+    session_snapshot: Optional[dict] = None  # genişletilmiş oturum state
     vocabulary: Optional[AgentVocabulary] = None
 
 

@@ -53,11 +53,37 @@ def create_session(
     return session
 
 
+def create_session_for_owner(
+    db: Session,
+    *,
+    owner_id: int,
+    title: Optional[str] = None,
+) -> AgentSession:
+    session = AgentSession(
+        franchise_owner_id=owner_id,
+        title=(title or "Yeni sohbet")[:200],
+    )
+    db.add(session)
+    db.flush()
+    return session
+
+
 def get_session_for_buyer(db: Session, session_id: int, buyer_id: int) -> Optional[AgentSession]:
     return db.scalar(
         select(AgentSession).where(
             AgentSession.id == session_id,
             AgentSession.buyer_id == buyer_id,
+        )
+    )
+
+
+def get_session_for_owner(
+    db: Session, session_id: int, owner_id: int
+) -> Optional[AgentSession]:
+    return db.scalar(
+        select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.franchise_owner_id == owner_id,
         )
     )
 
@@ -103,6 +129,52 @@ def append_message(
         session.title = content[:200]
     db.flush()
     return msg
+
+
+def load_session_snapshot(db: Session, session_id: int) -> Optional[dict]:
+    """Son asistan turlarından bağlam: liste, karşılaştırma, filtreler."""
+    rows = db.scalars(
+        select(AgentMessage)
+        .where(
+            AgentMessage.session_id == session_id,
+            AgentMessage.role == AgentMessageRole.assistant.value,
+        )
+        .order_by(AgentMessage.created_at.desc())
+        .limit(10)
+    ).all()
+
+    last_list: Optional[dict] = None
+    last_compare_ids: list[int] = []
+    last_intent: Optional[str] = None
+    last_brand_id: Optional[int] = None
+
+    for row in rows:
+        related = _json_list(row.related_brand_ids) or []
+        filters = _json_dict(row.filters_applied) or {}
+        if not last_intent:
+            last_intent = row.intent
+        if related and last_list is None:
+            last_list = {
+                "filters_applied": filters,
+                "related_brand_ids": related,
+                "intent": row.intent,
+            }
+            last_brand_id = related[0]
+        if row.intent == "brand_compare" and related and not last_compare_ids:
+            last_compare_ids = related
+        if last_list and last_compare_ids:
+            break
+
+    if not last_list and not last_compare_ids:
+        return None
+
+    return {
+        "filters_applied": (last_list or {}).get("filters_applied") or {},
+        "related_brand_ids": (last_list or {}).get("related_brand_ids") or [],
+        "intent": (last_list or {}).get("intent") or last_intent,
+        "compare_brand_ids": last_compare_ids,
+        "last_brand_id": last_brand_id,
+    }
 
 
 def last_brand_search_state(db: Session, session_id: int) -> Optional[dict]:
@@ -205,6 +277,79 @@ def session_messages(db: Session, session_id: int, buyer_id: int) -> list[AgentM
 
 def delete_session(db: Session, session_id: int, buyer_id: int) -> bool:
     session = get_session_for_buyer(db, session_id, buyer_id)
+    if not session:
+        return False
+    db.delete(session)
+    return True
+
+
+def list_sessions_for_owner(
+    db: Session, owner_id: int, *, limit: int = 20
+) -> list[AgentSessionRead]:
+    sessions = db.scalars(
+        select(AgentSession)
+        .where(AgentSession.franchise_owner_id == owner_id)
+        .order_by(AgentSession.updated_at.desc())
+        .limit(limit)
+    ).all()
+    out: list[AgentSessionRead] = []
+    for s in sessions:
+        msg_count = int(
+            db.scalar(
+                select(func.count(AgentMessage.id)).where(AgentMessage.session_id == s.id)
+            )
+            or 0
+        )
+        last = db.scalar(
+            select(AgentMessage)
+            .where(AgentMessage.session_id == s.id)
+            .order_by(AgentMessage.created_at.desc())
+            .limit(1)
+        )
+        preview = last.content[:120] if last else None
+        out.append(
+            AgentSessionRead(
+                id=s.id,
+                title=s.title,
+                brand_context_id=s.brand_context_id,
+                created_at=s.created_at,
+                updated_at=s.updated_at,
+                message_count=msg_count,
+                last_message_preview=preview,
+            )
+        )
+    return out
+
+
+def session_messages_for_owner(
+    db: Session, session_id: int, owner_id: int
+) -> list[AgentMessageRead]:
+    session = get_session_for_owner(db, session_id, owner_id)
+    if not session:
+        return []
+    rows = db.scalars(
+        select(AgentMessage)
+        .where(AgentMessage.session_id == session_id)
+        .order_by(AgentMessage.created_at.asc())
+    ).all()
+    return [
+        AgentMessageRead(
+            id=m.id,
+            session_id=m.session_id,
+            role=m.role,
+            content=m.content,
+            intent=m.intent,
+            source=m.source,
+            filters_applied=_json_dict(m.filters_applied),
+            related_brand_ids=_json_list(m.related_brand_ids),
+            created_at=m.created_at,
+        )
+        for m in rows
+    ]
+
+
+def delete_session_for_owner(db: Session, session_id: int, owner_id: int) -> bool:
+    session = get_session_for_owner(db, session_id, owner_id)
     if not session:
         return False
     db.delete(session)

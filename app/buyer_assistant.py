@@ -21,10 +21,16 @@ from .agent_nlu import (
     filters_human_label,
     parse_agent_query,
 )
-from .brand_metrics import batch_estimated_roi_percent, build_brand_metrics
+from .brand_metrics import (
+    batch_brand_compare_snapshots,
+    batch_estimated_roi_percent,
+    build_brand_metrics,
+    build_compare_insights_text,
+)
 from .brand_service import build_compare_response, build_territory_list, list_approved_brands
+from .brand_vector_search import semantic_brand_search
 from .buyer_service import score_brand_match
-from .models import Application, Brand, Buyer
+from .models import Application, ApplicationStatus, Brand, Buyer
 from .schemas import (
     AssistantBrandRead,
     AssistantQueryRequest,
@@ -38,6 +44,18 @@ from .schemas import (
 
 AGENT_RESULT_LIMIT = 4
 AGENT_CANDIDATE_POOL = 40
+
+COMPARE_DISCLAIMER = (
+    " Bu karşılaştırma yalnızca bilgilendirme amaçlıdır; yatırım tavsiyesi değildir. "
+    "Gelecekteki getiri veya iş sonuçları garanti edilmez — karar vermeden önce kendi "
+    "araştırmanızı yapmanızı öneririz."
+)
+
+
+def _with_compare_disclaimer(answer: str) -> str:
+    if COMPARE_DISCLAIMER.strip() in answer:
+        return answer
+    return answer.rstrip() + COMPARE_DISCLAIMER
 
 
 def _rank_agent_brands(
@@ -127,6 +145,81 @@ def _refine_suggestions() -> list[AssistantSuggestion]:
     ]
 
 
+def _compare_suggestions(
+    db: Session,
+    ctx: Optional[AgentBuyerContext] = None,
+    *,
+    brands: Optional[list[Brand]] = None,
+) -> list[AssistantSuggestion]:
+    """Karşılaştırma bağlamında marka adı örnekleri — bütçe/sektör chip'leri değil."""
+    suggestions: list[AssistantSuggestion] = []
+    pair: list[Brand] = list(brands or [])
+
+    if len(pair) < 2 and ctx:
+        snap = ctx.session_snapshot or ctx.last_search_state or {}
+        compare_ids = [int(x) for x in snap.get("compare_brand_ids") or []]
+        if len(compare_ids) >= 2:
+            pair = _brands_by_ids(db, compare_ids[:4])
+        elif snap.get("related_brand_ids"):
+            list_ids = [int(x) for x in snap["related_brand_ids"][:4]]
+            pair = _brands_by_ids(db, list_ids)
+
+    if len(pair) >= 2:
+        for i in range(min(len(pair) - 1, 2)):
+            a, b = pair[i], pair[i + 1]
+            suggestions.append(
+                AssistantSuggestion(
+                    label=f"{a.name} ile {b.name} karşılaştır",
+                    action="refine_search",
+                )
+            )
+        if len(pair) >= 3:
+            suggestions.append(
+                AssistantSuggestion(
+                    label=f"{pair[0].name} ile {pair[2].name} karşılaştır",
+                    action="refine_search",
+                )
+            )
+
+    if not suggestions:
+        fallback = list(
+            db.scalars(
+                select(Brand)
+                .where(Brand.is_approved.is_(True))
+                .order_by(Brand.id.asc())
+                .limit(4)
+            ).all()
+        )
+        if len(fallback) >= 2:
+            suggestions.append(
+                AssistantSuggestion(
+                    label=f"{fallback[0].name} ile {fallback[1].name} karşılaştır",
+                    action="refine_search",
+                )
+            )
+            if len(fallback) >= 3:
+                suggestions.append(
+                    AssistantSuggestion(
+                        label=f"{fallback[0].name} ile {fallback[2].name} karşılaştır",
+                        action="refine_search",
+                    )
+                )
+
+    if not suggestions:
+        suggestions = [
+            AssistantSuggestion(
+                label="Pizza Pro ile Komagene Hub karşılaştır",
+                action="refine_search",
+            ),
+            AssistantSuggestion(
+                label="Brew Max ile Clean TR karşılaştır",
+                action="refine_search",
+            ),
+        ]
+
+    return suggestions[:4]
+
+
 def _build_brand_search_answer(
     *,
     filters: AgentSearchFilters,
@@ -143,7 +236,38 @@ def _build_brand_search_answer(
         return (
             f"Profilinizdeki {buyer.investment_budget:,.0f} TL bütçeye göre {count} marka öneriyorum:"
         )
+    if filters.max_cost is not None:
+        return f"{filters.max_cost:,.0f} TL bütçenize uygun {count} fırsat buldum:"
     return f"{human} için {count} fırsat buldum:"
+
+
+def _build_relaxed_search_note(
+    original: AgentSearchFilters,
+    used: AgentSearchFilters,
+    *,
+    brands: list[AssistantBrandRead],
+) -> str:
+    if not brands:
+        return ""
+    budget_ceiling = original.max_cost
+    budget_ok = budget_ceiling is None or all(
+        float(b.initial_cost) <= budget_ceiling * 1.05 for b in brands
+    )
+    if original.sector and not used.sector:
+        if budget_ok and budget_ceiling:
+            return (
+                f"«{original.sector}» sektöründe seçenek sınırlı; "
+                f"{budget_ceiling:,.0f} TL bütçenize uygun diğer markalar:"
+            )
+        return f"«{original.sector}» sektöründe uygun marka bulamadım. Bunun yerine "
+    if original.q and not used.q and not used.sector:
+        if budget_ok and budget_ceiling:
+            return (
+                f"«{original.q}» için tam eşleşme yok; "
+                f"{budget_ceiling:,.0f} TL bütçenize uygun yakın markalar:"
+            )
+        return f"«{original.q}» için tam eşleşme bulamadım. Yakın olarak "
+    return ""
 
 
 def _search_brands_for_agent(
@@ -244,15 +368,34 @@ def _search_with_relaxed_filters(
         return brands, ids, filters
 
     relaxed = AgentSearchFilters(**{k: v for k, v in filters.__dict__.items()})
+
+    # Bütçe tavanı korunur; sektör/şehir/bölge daraltıcıysa önce onları gevşet.
+    if relaxed.sector or relaxed.location or relaxed.region:
+        scope_relaxed = AgentSearchFilters(**{k: v for k, v in relaxed.__dict__.items()})
+        scope_relaxed.sector = None
+        scope_relaxed.use_profile_sector = False
+        scope_relaxed.location = None
+        scope_relaxed.region = None
+        scope_relaxed.use_profile_city = False
+        brands, ids = _search_brands_for_agent(db, buyer, scope_relaxed, ctx)
+        if brands:
+            return brands, ids, scope_relaxed
+
     if relaxed.q:
         relaxed.q = None
         brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
         if brands:
             return brands, ids, relaxed
 
-    if relaxed.max_cost is not None:
-        relaxed.max_cost = relaxed.max_cost * 1.2
+    if relaxed.min_cost is not None:
         relaxed.min_cost = None
+        brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
+        if brands:
+            return brands, ids, relaxed
+
+    # Düşük bütçe tavanında (ör. 500 bin) hafif gevşet; yüksek bütçede anlamsız.
+    if relaxed.max_cost is not None and relaxed.max_cost < 2_000_000:
+        relaxed.max_cost = relaxed.max_cost * 1.2
         brands, ids = _search_brands_for_agent(db, buyer, relaxed, ctx)
         if brands:
             return brands, ids, relaxed
@@ -371,62 +514,157 @@ def _pick_from_previous_brands(
 
 
 def _resolve_brands_by_names(db: Session, names: list[str]) -> list[Brand]:
+    """Marka adlarını Türkçe-duyarsız ve ek-toleranslı eşleştirir.
+    'doner hub' -> 'Döner Hub', 'burger pointi' -> 'Burger Point' gibi."""
+    approved = list(
+        db.scalars(select(Brand).where(Brand.is_approved.is_(True))).all()
+    )
+    norm_index = [(b, _normalize(b.name)) for b in approved]
+
     found: list[Brand] = []
     seen: set[int] = set()
     for name in names:
-        cleaned = name.strip()
-        if not cleaned:
+        nq = _normalize(name)
+        if not nq:
             continue
-        pattern = f"%{cleaned}%"
-        row = db.scalar(
-            select(Brand).where(
-                Brand.is_approved.is_(True),
-                Brand.name.ilike(pattern),
-            )
-        )
-        if not row:
-            # "Komagene" → "Komagene Hub" gibi kısmi adlar için ilk kelime
-            first = cleaned.split()[0]
-            if len(first) >= 3:
-                row = db.scalar(
-                    select(Brand).where(
-                        Brand.is_approved.is_(True),
-                        Brand.name.ilike(f"%{first}%"),
-                    )
-                )
-        if row and row.id not in seen:
-            seen.add(row.id)
-            found.append(row)
+        q_tokens = [t for t in nq.split() if len(t) >= 3]
+        best: Optional[Brand] = None
+        best_score = 0
+        for brand, nb in norm_index:
+            if not nb:
+                continue
+            if nb in nq or (len(nq) >= 4 and nq in nb):
+                score = 100 + len(nb)
+            else:
+                score = 0
+                for qt in q_tokens:
+                    for bt in nb.split():
+                        if qt == bt:
+                            score += 10
+                        elif len(bt) >= 4 and (qt.startswith(bt) or bt.startswith(qt)):
+                            score += 6
+            if score > best_score:
+                best_score = score
+                best = brand
+        # En az bir anlamlı token eşleşmesi (>=6) gerek; rastgele eşleşmeyi engelle
+        if best is not None and best_score >= 6 and best.id not in seen:
+            seen.add(best.id)
+            found.append(best)
     return found
 
 
-def _compare_answer(
-    db: Session, buyer: Buyer, nlu_names: list[str]
-) -> AssistantQueryResponse:
-    brands = _resolve_brands_by_names(db, nlu_names)
-    if len(brands) < 2:
-        return AssistantQueryResponse(
-            answer=(
-                "Karşılaştırma için iki marka adı yazın. "
-                "Örnek: «Komagene ile Starbucks karşılaştır»."
-            ),
-            intent="brand_compare",
-            suggestions=_refine_suggestions(),
-            source="rules",
+def _approved_franchise_brands(db: Session, buyer: Buyer) -> list[Brand]:
+    brand_ids = [
+        int(x)
+        for x in db.scalars(
+            select(Application.brand_id).where(
+                Application.buyer_id == buyer.id,
+                Application.status == ApplicationStatus.approved,
+            )
+        ).all()
+    ]
+    if not brand_ids:
+        return []
+    return list(
+        db.scalars(
+            select(Brand).where(
+                Brand.id.in_(brand_ids),
+                Brand.is_approved.is_(True),
+            )
+        ).all()
+    )
+
+
+def _brands_by_ids(db: Session, brand_ids: list[int]) -> list[Brand]:
+    if not brand_ids:
+        return []
+    rows = db.scalars(
+        select(Brand).where(
+            Brand.id.in_(brand_ids),
+            Brand.is_approved.is_(True),
         )
+    ).all()
+    by_id = {b.id: b for b in rows}
+    return [by_id[i] for i in brand_ids if i in by_id]
+
+
+def _resolve_anchor_brand(
+    db: Session,
+    *,
+    anchor_brand_id: Optional[int],
+    ctx: AgentBuyerContext,
+    nlu_names: list[str],
+) -> Optional[Brand]:
+    if anchor_brand_id is not None:
+        anchor = db.scalar(
+            select(Brand).where(
+                Brand.id == anchor_brand_id,
+                Brand.is_approved.is_(True),
+            )
+        )
+        if anchor:
+            return anchor
+    if ctx.last_search_state:
+        prev_ids = ctx.last_search_state.get("related_brand_ids") or []
+        if prev_ids:
+            brands = _brands_by_ids(db, [int(prev_ids[0])])
+            if brands:
+                return brands[0]
+    if len(nlu_names) == 1:
+        resolved = _resolve_brands_by_names(db, nlu_names)
+        if resolved:
+            return resolved[0]
+    return None
+
+
+def _compose_compare_answer(
+    db: Session,
+    brands: list[Brand],
+    *,
+    header: str,
+) -> tuple[str, BrandCompareResponse, dict[int, float]]:
     pair = brands[:4]
-    compare: BrandCompareResponse = build_compare_response(pair)
-    cost_row = next((r for r in compare.comparison_table.rows if r.key == "initial_cost"), None)
-    parts = [f"{c.name}" for c in compare.comparison_table.columns]
-    answer = f"{' ve '.join(parts)} karşılaştırması: "
+    snapshots = batch_brand_compare_snapshots(db, pair)
+    roi_map = batch_estimated_roi_percent(db, pair)
+    insights = build_compare_insights_text(pair, snapshots, roi_map)
+    compare = build_compare_response(
+        pair, snapshots=snapshots, roi_map=roi_map, insights=insights
+    )
+    cost_row = next(
+        (r for r in compare.comparison_table.rows if r.key == "initial_cost"), None
+    )
+    answer = header.rstrip()
+    if not answer.endswith(":") and not answer.endswith("."):
+        answer += ":"
     if cost_row and cost_row.values:
-        answer += "Yatırım maliyetleri — " + ", ".join(
+        answer += " Yatırım maliyetleri — " + ", ".join(
             f"{compare.comparison_table.columns[i].name}: {cost_row.values[i] or '—'}"
             for i in range(min(len(cost_row.values), len(compare.comparison_table.columns)))
-        )
-        answer += "."
-    assistant = []
+        ) + "."
+    if insights:
+        answer += "\n\n" + insights
+    return answer, compare, roi_map
+
+
+def _build_compare_response(
+    db: Session,
+    buyer: Buyer,
+    brands: list[Brand],
+    *,
+    answer: str,
+    filters_applied: Optional[dict] = None,
+) -> AssistantQueryResponse:
+    pair = brands[:4]
+    snapshots = batch_brand_compare_snapshots(db, pair)
     roi_map = batch_estimated_roi_percent(db, pair)
+    insights = build_compare_insights_text(pair, snapshots, roi_map)
+    compare = build_compare_response(
+        pair, snapshots=snapshots, roi_map=roi_map, insights=insights
+    )
+    full_answer = answer.rstrip()
+    if insights and insights not in full_answer:
+        full_answer += "\n\n" + insights
+    assistant = []
     for b in pair:
         score, reasons = score_brand_match(
             b,
@@ -444,14 +682,175 @@ def _compare_answer(
             )
         )
     return AssistantQueryResponse(
-        answer=answer,
+        answer=_with_compare_disclaimer(full_answer),
         intent="brand_compare",
         related_brands=assistant,
         related_brand_ids=[b.id for b in pair],
         compare=compare,
         suggestions=_default_suggestions(assistant),
-        filters_applied={"brand_names": nlu_names},
+        filters_applied=filters_applied or {"brand_ids": [b.id for b in pair]},
         source="rules",
+    )
+
+
+def _compare_with_owned_franchises(
+    db: Session,
+    buyer: Buyer,
+    *,
+    anchor_brand_id: Optional[int],
+    nlu_names: list[str],
+    ctx: AgentBuyerContext,
+) -> AssistantQueryResponse:
+    owned = _approved_franchise_brands(db, buyer)
+    if not owned:
+        return AssistantQueryResponse(
+            answer=(
+                "Onaylı bayiliğiniz yok; mevcut bayiliklerinizle karşılaştırma yapılamaz. "
+                "Önce bir markaya onaylı başvurunuz olmalı — veya iki marka adı yazarak karşılaştırın."
+            ),
+            intent="brand_compare",
+            suggestions=_compare_suggestions(db, ctx),
+            source="rules",
+        )
+
+    anchor = _resolve_anchor_brand(
+        db,
+        anchor_brand_id=anchor_brand_id,
+        ctx=ctx,
+        nlu_names=nlu_names,
+    )
+    brands: list[Brand] = []
+    if anchor:
+        brands.append(anchor)
+        for brand in owned:
+            if brand.id != anchor.id:
+                brands.append(brand)
+    else:
+        brands = owned[:4]
+
+    if len(brands) < 2:
+        only = brands[0].name if brands else "Bayiliğiniz"
+        return AssistantQueryResponse(
+            answer=(
+                f"Şu an yalnızca {only} için onaylı bayiliğiniz var. "
+                "Karşılaştırma için önce başka bir marka arayın, sonra «bende olan bayiliklerimle karşılaştır» deyin."
+            ),
+            intent="brand_compare",
+            suggestions=_compare_suggestions(db, ctx),
+            source="rules",
+        )
+
+    if anchor:
+        owned_names = ", ".join(b.name for b in owned[:3])
+        answer = (
+            f"{anchor.name} ile onaylı bayilikleriniz ({owned_names}) karşılaştırması:"
+        )
+    else:
+        answer = "Onaylı bayiliklerinizin karşılaştırması:"
+
+    answer, _, _ = _compose_compare_answer(db, brands[:4], header=answer)
+
+    return _build_compare_response(
+        db,
+        buyer,
+        brands[:4],
+        answer=answer,
+        filters_applied={"compare_with_owned": True, "anchor_brand_id": anchor.id if anchor else None},
+    )
+
+
+def _compare_with_previous_list(
+    db: Session,
+    buyer: Buyer,
+    ctx: AgentBuyerContext,
+) -> AssistantQueryResponse:
+    snap = ctx.session_snapshot or ctx.last_search_state or {}
+    compare_ids = [int(x) for x in snap.get("compare_brand_ids") or []]
+    if len(compare_ids) >= 2:
+        brands = _brands_by_ids(db, compare_ids[:4])
+        if len(brands) >= 2:
+            names = " ve ".join(b.name for b in brands[:2])
+            suffix = " (tekrar)" if len(brands) == 2 else ""
+            answer, _, _ = _compose_compare_answer(
+                db, brands, header=f"{names} karşılaştırması{suffix}"
+            )
+            return _build_compare_response(
+                db,
+                buyer,
+                brands,
+                answer=answer,
+                filters_applied={"repeat_compare": True, "brand_ids": compare_ids[:4]},
+            )
+
+    prev_ids = [int(x) for x in snap.get("related_brand_ids") or []]
+    brands = _brands_by_ids(db, prev_ids[:4])
+    if len(brands) < 2:
+        return AssistantQueryResponse(
+            answer=(
+                "Karşılaştırma için iki marka adı yazın. "
+                "Örnek: «Pizza Pro ile Komagene Hub karşılaştır»."
+            ),
+            intent="brand_compare",
+            suggestions=_compare_suggestions(db, ctx),
+            source="rules",
+        )
+    names = ", ".join(b.name for b in brands[:4])
+    answer, _, _ = _compose_compare_answer(
+        db, brands, header=f"Son aramanızdaki markalar ({names}) karşılaştırması"
+    )
+    return _build_compare_response(
+        db,
+        buyer,
+        brands,
+        answer=answer,
+        filters_applied={"from_previous_search": True, "brand_ids": prev_ids[:4]},
+    )
+
+
+def _compare_answer(
+    db: Session,
+    buyer: Buyer,
+    nlu_names: list[str],
+    *,
+    fallback_ids: Optional[list[int]] = None,
+    ctx: Optional[AgentBuyerContext] = None,
+) -> AssistantQueryResponse:
+    brands = _resolve_brands_by_names(db, nlu_names)
+    # İsimlerden 2 marka çözülemezse DB sözlüğü id'leriyle tamamla
+    if len(brands) < 2 and fallback_ids:
+        seen = {b.id for b in brands}
+        for bid in fallback_ids:
+            if bid in seen:
+                continue
+            extra = db.scalar(
+                select(Brand).where(Brand.id == bid, Brand.is_approved.is_(True))
+            )
+            if extra is not None:
+                brands.append(extra)
+                seen.add(bid)
+            if len(brands) >= 4:
+                break
+    if len(brands) < 2:
+        return AssistantQueryResponse(
+            answer=(
+                "Karşılaştırma için iki marka adı yazın. "
+                "Örnek: «Pizza Pro ile Komagene Hub karşılaştır»."
+            ),
+            intent="brand_compare",
+            suggestions=_compare_suggestions(db, ctx),
+            source="rules",
+        )
+    pair = brands[:4]
+    parts = [b.name for b in pair]
+    answer, _, _ = _compose_compare_answer(
+        db, pair, header=f"{' ve '.join(parts)} karşılaştırması"
+    )
+    return _build_compare_response(
+        db,
+        buyer,
+        pair,
+        answer=answer,
+        filters_applied={"brand_names": nlu_names},
     )
 
 
@@ -628,7 +1027,12 @@ def _maybe_llm_polish(
     filters: Optional[AgentSearchFilters] = None,
 ) -> AssistantQueryResponse:
     if response.intent not in (
-        "brand_search", "favorites_similar", "brand_detail", "brand_pick", "no_match",
+        "brand_search",
+        "favorites_similar",
+        "brand_detail",
+        "brand_pick",
+        "no_match",
+        "general",
     ):
         return response
     human = filters_human_label(
@@ -636,6 +1040,7 @@ def _maybe_llm_polish(
         float(buyer.investment_budget),
     )
     names = [b.name for b in response.related_brands]
+    original_source = response.source
     enhanced, source = maybe_enhance_answer(
         query=query,
         draft_answer=response.answer,
@@ -644,7 +1049,11 @@ def _maybe_llm_polish(
         filters_human=human,
     )
     response.answer = enhanced
-    response.source = source
+    # Veri kaynağı sinyalini (semantic/llm_tools) koru; LLM yalnızca metni cilaladı.
+    if original_source in ("semantic", "llm_tools"):
+        response.source = original_source
+    else:
+        response.source = source
     return response
 
 
@@ -657,6 +1066,14 @@ def answer_buyer_assistant(
     started = time.perf_counter()
     context = ctx or AgentBuyerContext()
     brand_id = payload.brand_id or payload.brand_context_id
+
+    if brand_id is None:
+        from .agent_router import try_llm_tool_route
+
+        routed = try_llm_tool_route(db, buyer, payload, context)
+        if routed is not None:
+            routed.latency_ms = int((time.perf_counter() - started) * 1000)
+            return routed
 
     if brand_id is not None:
         intent = classify_intent(payload.query, brand_id)
@@ -687,7 +1104,24 @@ def answer_buyer_assistant(
         return resp
 
     if intent == "brand_compare":
-        resp = _compare_answer(db, buyer, nlu.compare_brand_names)
+        if nlu.compare_with_owned:
+            resp = _compare_with_owned_franchises(
+                db,
+                buyer,
+                anchor_brand_id=brand_id,
+                nlu_names=nlu.compare_brand_names,
+                ctx=context,
+            )
+        elif nlu.compare_with_previous and (context.last_search_state or context.session_snapshot):
+            resp = _compare_with_previous_list(db, buyer, context)
+        else:
+            resp = _compare_answer(
+                db,
+                buyer,
+                nlu.compare_brand_names,
+                fallback_ids=nlu.db_brand_ids,
+                ctx=context,
+            )
         resp.latency_ms = int((time.perf_counter() - started) * 1000)
         return resp
 
@@ -848,9 +1282,41 @@ def answer_buyer_assistant(
         brands, brand_ids, used_filters = _search_with_relaxed_filters(
             db, buyer, nlu.filters, context
         )
-    answer = _build_brand_search_answer(
-        filters=used_filters, buyer=buyer, count=len(brands)
-    )
+    # Semantik (pgvector) fallback: kural/DB araması boş kaldıysa VEYA serbest
+    # metin (q) gevşetilip alakasız genel listeye düşüldüyse semantik dene.
+    semantic_used = False
+    q_relaxed = bool(nlu.filters.q) and not used_filters.q
+    if not brands or q_relaxed:
+        sem_ids = semantic_brand_search(
+            db,
+            payload.query,
+            location=nlu.filters.location,
+            min_cost=nlu.filters.min_cost,
+            max_cost=nlu.filters.max_cost,
+            limit=AGENT_RESULT_LIMIT,
+        )
+        if sem_ids:
+            sem_brands, sem_brand_ids = _search_brands_by_ids(
+                db, buyer, sem_ids, context, nlu.filters
+            )
+            if sem_brands:
+                brands, brand_ids = sem_brands, sem_brand_ids
+                semantic_used = True
+
+    # Kullanıcının istediği sektör/anahtar kelime gevşetildiyse dürüstçe belirt.
+    relaxed_note = ""
+    if semantic_used:
+        relaxed_note = "Tam eşleşme bulamadım ama anlamca yakın markalar buldum. "
+    elif brands:
+        relaxed_note = _build_relaxed_search_note(
+            nlu.filters, used_filters, brands=brands
+        )
+    if relaxed_note:
+        answer = f"{relaxed_note} {len(brands)} marka listeliyorum:"
+    else:
+        answer = _build_brand_search_answer(
+            filters=used_filters, buyer=buyer, count=len(brands)
+        )
     suggestions = _default_suggestions(brands)
     if not brands:
         suggestions = _refine_suggestions()
@@ -862,7 +1328,7 @@ def answer_buyer_assistant(
         related_brands=brands,
         related_brand_ids=brand_ids,
         filters_applied=filters_applied_dict(used_filters),
-        source="rules",
+        source="semantic" if semantic_used else "rules",
     )
     resp = _maybe_llm_polish(resp, query=payload.query, buyer=buyer, filters=used_filters)
     resp.latency_ms = int((time.perf_counter() - started) * 1000)

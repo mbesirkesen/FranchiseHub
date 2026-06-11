@@ -6,13 +6,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..brand_metrics import build_brand_metrics
+from ..brand_metrics import (
+    batch_brand_compare_snapshots,
+    batch_estimated_roi_percent,
+    build_brand_metrics,
+    build_compare_insights_text,
+)
 from ..brand_service import (
     build_compare_response,
     build_media_list,
     build_territory_list,
     get_approved_brand_or_404,
     list_approved_brands,
+    list_brand_sectors,
     list_fdd_metadata,
     total_pages,
 )
@@ -37,6 +43,7 @@ from ..schemas import (
     BrandTerritoryListResponse,
     RegionListResponse,
     RegionOption,
+    SectorListResponse,
 )
 
 router = APIRouter(tags=["brands-discovery"])
@@ -50,6 +57,11 @@ def list_regions():
             for key in REGION_ALIASES.keys()
         ]
     )
+
+
+@router.get("/brands/sectors", response_model=SectorListResponse)
+def list_sectors(db: Session = Depends(get_db)):
+    return SectorListResponse(items=list_brand_sectors(db))
 
 
 @router.get("/brands", response_model=BrandListPage)
@@ -109,7 +121,12 @@ def compare_brands(payload: BrandCompareRequest, db: Session = Depends(get_db)):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="One or more brand IDs were not found",
         )
-    return build_compare_response(brands)
+    snapshots = batch_brand_compare_snapshots(db, brands)
+    roi_map = batch_estimated_roi_percent(db, brands)
+    insights = build_compare_insights_text(brands, snapshots, roi_map)
+    return build_compare_response(
+        brands, snapshots=snapshots, roi_map=roi_map, insights=insights
+    )
 
 
 @router.get("/brands/{brand_id}/media", response_model=BrandMediaListResponse)
